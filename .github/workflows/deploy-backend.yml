@@ -1,0 +1,46 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches: [main]  # or 'main' for production
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      YOTI_CLIENT_SDK_ID: ${{ secrets.YOTI_CLIENT_SDK_ID }}
+      YOTI_WEBHOOK_AUTH: ${{ secrets.YOTI_WEBHOOK_AUTH }}
+      # etc...
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run tests
+      run: npm test
+
+    - name: Build (optional)
+      run: npm run build
+
+    - name: Deploy to Render/Cloud Run/Fly.io/etc
+      run: |
+        # Example for Cloud Run
+        gcloud auth activate-service-account --key-file="${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}"
+        gcloud config set project YOUR_PROJECT
+        gcloud run deploy howdy-backend \
+          --source . \
+          --region us-central1 \
+          --platform managed \
+          --allow-unauthenticated
