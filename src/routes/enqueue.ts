@@ -1,6 +1,7 @@
 import express from 'express';
 import { db } from '../firebase';
 import { verifyJwt } from '../verifyJwt';
+import { matchUsers } from '../services/matchmaker';
 
 export const enqueueRouter = express.Router();
 enqueueRouter.use(verifyJwt);
@@ -17,8 +18,10 @@ enqueueRouter.post('/', async (req, res) => {
     await db.collection('matchQueue').doc(uid).set({
       prefs,
       timestamp: Date.now(),
-      status: 'waiting',
+      state: 'searching',
     });
+
+    await matchUsers(); // ✅ now runs matchmaking after enqueue
 
     return res.status(200).json({ status: 'queued' });
   } catch (error) {

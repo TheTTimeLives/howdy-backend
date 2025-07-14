@@ -10,6 +10,9 @@ import { tokenRouter } from './routes/token';
 import { usersRouter } from './routes/users';
 import { categoriesRouter } from './routes/categories';
 import { yotiRouter } from './routes/yoti';
+import { matchQueueRouter } from './routes/matchQueue';
+import { matchActionsRouter } from './routes/matchActions';
+import { agoraRouter } from './routes/agora';
 
 
 const app = express();
@@ -22,6 +25,11 @@ app.use('/users', usersRouter);
 app.use('/auth', authRouter);
 app.use('/categories', categoriesRouter);
 app.use('/yoti', yotiRouter);
+app.use('/matchQueue', matchQueueRouter);
+app.use('/match', matchActionsRouter);
+app.use('/agora', agoraRouter);
+
+
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
