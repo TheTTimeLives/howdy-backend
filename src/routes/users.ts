@@ -237,3 +237,85 @@ usersRouter.post('/metadata', async (req, res) => {
     return res.status(500).json({ error: 'Failed to process avatar' });
   }
 });
+
+usersRouter.get('/:uid', async (req, res) => {
+  const { uid } = req.params;
+
+  try {
+    const doc = await db.collection('user_metadata').doc(uid).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Not found' });
+
+    return res.status(200).json(doc.data());
+  } catch (e) {
+    console.error(`❌ Failed to fetch metadata for ${uid}:`, e);
+    return res.status(500).json({ error: 'Failed to load user metadata' });
+  }
+});
+
+usersRouter.get('/:uid/reviews', async (req, res) => {
+  const { uid } = req.params;
+
+  try {
+    const doc = await db.collection('users').doc(uid).collection('user-metadata').doc('reviews').get();
+    if (!doc.exists) return res.json({ average: 0, count: 0 });
+
+    const data = doc.data();
+    const ratings = Object.values(data || {}).map((entry: any) => entry.rating).filter((r) => typeof r === 'number');
+
+    const average = ratings.length
+      ? ratings.reduce((sum, r) => sum + r, 0) / ratings.length
+      : 0;
+
+    return res.status(200).json({ average, count: ratings.length });
+  } catch (e) {
+    console.error(`❌ Failed to load reviews for ${uid}:`, e);
+    return res.status(500).json({ error: 'Failed to fetch reviews' });
+  }
+});
+
+usersRouter.post('/review', verifyJwt, async (req, res) => {
+  const uid = (req as any).uid;
+  const { partnerId, channelName, rating, comment, superlatives } = req.body;
+
+  if (!partnerId || !channelName || rating === undefined) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  try {
+    const reviewData: any = {
+      rating,
+      comment,
+      timestamp: Date.now(),
+    };
+
+    if (Array.isArray(superlatives) && superlatives.length > 0) {
+      reviewData.superlatives = superlatives;
+    }
+
+    await db.collection('users')
+      .doc(partnerId)
+      .collection('user-metadata')
+      .doc('reviews')
+      .set({ [uid]: reviewData }, { merge: true });
+
+    // ✅ Mark as reviewed
+    const callSnap = await db.collection('users')
+      .doc(uid)
+      .collection('user-metadata')
+      .doc('history')
+      .collection('calls')
+      .where('partnerId', '==', partnerId)
+      .where('channelName', '==', channelName)
+      .limit(1)
+      .get();
+
+    if (!callSnap.empty) {
+      await callSnap.docs[0].ref.update({ reviewed: true });
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('❌ Review submission failed:', e);
+    return res.status(500).json({ error: 'Failed to submit review' });
+  }
+});

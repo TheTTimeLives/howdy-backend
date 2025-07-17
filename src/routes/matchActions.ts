@@ -37,6 +37,13 @@ matchActionsRouter.post('/accept', async (req, res) => {
 
     const callId = callRef.id;
 
+    const callHistoryEntry = (partnerId: string, channelName: string) => ({
+      partnerId,
+      channelName,
+      timestamp: Date.now(),
+      reviewed: false, // ✅ Added field
+    });
+
     await Promise.all([
       docRef.update({ state: 'matched', callId }),
       partnerRef.update({ state: 'matched', callId }),
@@ -45,9 +52,7 @@ matchActionsRouter.post('/accept', async (req, res) => {
         .collection('user-metadata')
         .doc('matches')
         .set(
-          {
-            [data.partnerId]: { matched: true, timestamp: Date.now() },
-          },
+          { [data.partnerId]: { matched: true, timestamp: Date.now() } },
           { merge: true }
         ),
       db.collection('users')
@@ -55,15 +60,26 @@ matchActionsRouter.post('/accept', async (req, res) => {
         .collection('user-metadata')
         .doc('matches')
         .set(
-          {
-            [uid]: { matched: true, timestamp: Date.now() },
-          },
+          { [uid]: { matched: true, timestamp: Date.now() } },
           { merge: true }
         ),
+      db.collection('users')
+        .doc(uid)
+        .collection('user-metadata')
+        .doc('history')
+        .collection('calls')
+        .doc(callId)
+        .set(callHistoryEntry(data.partnerId, data.channelName)),
+      db.collection('users')
+        .doc(data.partnerId)
+        .collection('user-metadata')
+        .doc('history')
+        .collection('calls')
+        .doc(callId)
+        .set(callHistoryEntry(uid, data.channelName)),
     ]);
 
     console.log('✅ Match completed between', uid, 'and', data.partnerId);
-
     return res.status(200).json({ status: 'matched', callId });
   }
 
@@ -113,21 +129,16 @@ matchActionsRouter.post('/decline', async (req, res) => {
 
   await Promise.all([
     userMetadataRef.set(
-      {
-        [partnerId]: { declined: true, timestamp: now },
-      },
+      { [partnerId]: { declined: true, timestamp: now } },
       { merge: true }
     ),
     partnerMetadataRef.set(
-      {
-        [uid]: { declined: true, timestamp: now },
-      },
+      { [uid]: { declined: true, timestamp: now } },
       { merge: true }
     ),
   ]);
 
   console.log('❌ Match declined by', uid);
-
   return res.status(200).json({ status: 'declined' });
 });
 
@@ -141,6 +152,5 @@ matchActionsRouter.post('/call/end', async (req, res) => {
   });
 
   console.log('📞 Call ended:', callId);
-
   return res.status(200).json({ status: 'ended' });
 });

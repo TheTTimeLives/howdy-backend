@@ -17,9 +17,11 @@ enqueueRouter.post('/', async (req, res) => {
   try {
     await db.collection('matchQueue').doc(uid).set({
       prefs,
+      topic: prefs.topic || null, // ✅ Save optional topic
       timestamp: Date.now(),
       state: 'searching',
     });
+
 
     await matchUsers(); // ✅ now runs matchmaking after enqueue
 

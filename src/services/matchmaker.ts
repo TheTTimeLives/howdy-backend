@@ -14,22 +14,26 @@ export const matchUsers = async () => {
     const uid = user.id;
     const userData = user.data();
 
-    const userMetadataSnap = await db.collection('users')
+    const userMetadataSnap = await db
+      .collection('users')
       .doc(uid)
       .collection('user-metadata')
       .doc('matches')
       .get();
 
-    const previouslyMatched = userMetadataSnap.exists ? userMetadataSnap.data() ?? {} : {};
+    const previouslyMatched = userMetadataSnap.exists
+      ? userMetadataSnap.data() ?? {}
+      : {};
 
     for (let j = i + 1; j < users.length; j++) {
       const candidate = users[j];
       const candidateId = candidate.id;
+      const candidateData = candidate.data();
 
-      // Skip if either user has previously declined the other
       if (previouslyMatched[candidateId]?.declined) continue;
 
-      const candidateMetadataSnap = await db.collection('users')
+      const candidateMetadataSnap = await db
+        .collection('users')
         .doc(candidateId)
         .collection('user-metadata')
         .doc('matches')
@@ -49,14 +53,17 @@ export const matchUsers = async () => {
           partnerId: candidateId,
           channelName,
           accepted: false,
+          topic: candidate.data().prefs?.topic || null, // ✅ show THEIR topic
         }),
         queueRef.doc(candidateId).update({
           state: 'match-pending',
           partnerId: uid,
           channelName,
           accepted: false,
+          topic: user.data().prefs?.topic || null, // ✅ show THEIR topic
         }),
       ]);
+
 
       return;
     }
