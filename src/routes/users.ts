@@ -2,6 +2,10 @@ import express from 'express';
 import { db } from '../firebase';
 import { verifyJwt } from '../verifyJwt';
 import axios from 'axios';
+import * as admin from 'firebase-admin';
+import { v4 as uuidv4 } from 'uuid';
+import path from 'path';
+
 const TENOR_API_KEY = process.env.TENOR_API_KEY;
 const TENOR_CLIENT_KEY = 'howdy-app-123';
 
@@ -49,7 +53,18 @@ usersRouter.get('/me', async (req, res) => {
         }));
     }
 
+    // 🧠 Determine profile image type
+    const photoUrl = metadata?.photoUrl;
+    const photoType = photoUrl?.startsWith('assets/')
+      ? 'asset'
+      : photoUrl?.startsWith('http')
+        ? 'hosted'
+        : null;
+
     return res.status(200).json({
+      username: metadata?.username ?? '',
+      photoUrl,
+      photoType,
       joinedPools,
       blockedCategories,
       verificationStatus: metadata?.verificationStatus ?? 'awaiting',
@@ -62,6 +77,7 @@ usersRouter.get('/me', async (req, res) => {
     return res.status(500).json({ error: 'Failed to fetch user metadata' });
   }
 });
+
 
 usersRouter.post('/verification/reset', async (req, res) => {
   const uid = (req as any).uid;
@@ -121,20 +137,18 @@ usersRouter.get('/tenor/search', async (req, res) => {
       },
     });
 
-    const gifs = r.data.results
-    .map((result: any) => {
-    const url = result?.media_formats?.gif?.url;
-    return typeof url === 'string' ? url : null;
-  })
-
-      .filter((url: string | null) => url !== null);
+    const gifs = r.data.results.map((result: any) =>
+      result?.media_formats?.gifpreview?.url ??
+      result?.media_formats?.tinygifpreview?.url
+    ).filter((url: string | null) => !!url);
 
     res.status(200).json({ gifs });
   } catch (e) {
-    console.error('❌ Tenor search failed', e);
+    console.error('❌ Tenor search failed:', e);
     res.status(500).json({ error: 'Tenor search failed' });
   }
 });
+
 
 usersRouter.post('/metadata', async (req, res) => {
   const uid = (req as any).uid;
@@ -158,3 +172,68 @@ usersRouter.post('/metadata', async (req, res) => {
   }
 });
 
+usersRouter.post('/metadata', async (req, res) => {
+  const uid = (req as any).uid;
+  const { username, photoUrl } = req.body;
+
+  if (!username || !photoUrl) {
+    return res.status(400).json({ error: 'Missing username or photoUrl' });
+  }
+
+  const isAsset = photoUrl.startsWith('assets/'); // local static asset path
+
+  try {
+    const userDoc = db.collection('user_metadata').doc(uid);
+    const existing = await userDoc.get();
+    const oldPath = existing.data()?.photoStoragePath;
+
+    let finalPhotoUrl = photoUrl;
+    let finalStoragePath = undefined;
+
+    // 🔁 Delete previous Firebase image (if any)
+    if (oldPath) {
+      try {
+        await admin.storage().bucket().file(oldPath).delete();
+        console.log(`🗑 Deleted previous avatar: ${oldPath}`);
+      } catch (err) {
+        console.warn('⚠️ Could not delete old image:', err);
+      }
+    }
+
+    // 🧠 If it's a Tenor image, proxy and upload it to Firebase Storage
+    if (!isAsset && photoUrl.startsWith('http')) {
+      const axiosResp = await axios.get(photoUrl, { responseType: 'arraybuffer' });
+      const buffer = Buffer.from(axiosResp.data, 'binary');
+
+      const ext = path.extname(new URL(photoUrl).pathname).replace('.', '') || 'jpg';
+      const filename = `profile-images/${uid}.${ext}`;
+
+      const file = admin.storage().bucket().file(filename);
+      await file.save(buffer, {
+        metadata: {
+          contentType: `image/${ext}`,
+          metadata: {
+            firebaseStorageDownloadTokens: uuidv4(),
+          },
+        },
+        public: true,
+      });
+
+      finalPhotoUrl = `https://storage.googleapis.com/${file.bucket.name}/${file.name}`;
+      finalStoragePath = filename;
+    }
+
+    // ✅ Save user metadata
+    await userDoc.set({
+      username,
+      photoUrl: finalPhotoUrl,
+      photoStoragePath: finalStoragePath,
+      onboarded: true,
+    }, { merge: true });
+
+    return res.status(200).json({ ok: true, photoUrl: finalPhotoUrl });
+  } catch (e) {
+    console.error('❌ Failed to update metadata:', e);
+    return res.status(500).json({ error: 'Failed to process avatar' });
+  }
+});

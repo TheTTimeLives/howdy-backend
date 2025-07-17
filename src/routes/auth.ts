@@ -41,20 +41,34 @@ authRouter.post('/signup', async (req, res) => {
 });
 
 authRouter.post('/login', async (req, res) => {
-  const { email, password } = req.body;
+  const email = req.body.email?.toLowerCase()?.trim();
+  const password = req.body.password;
+
   if (!email || !password) {
     return res.status(400).json({ error: 'Missing fields' });
   }
 
   try {
     const snapshot = await db.collection('users').where('email', '==', email).get();
-    if (snapshot.empty) return res.status(401).json({ error: 'Invalid credentials' });
+    if (snapshot.empty) {
+      console.log('❌ No user found for email:', email);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     const userDoc = snapshot.docs[0];
     const userData = userDoc.data();
-    const isMatch = await bcrypt.compare(password, userData.passwordHash);
 
-    if (!isMatch) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!userData.passwordHash) {
+      console.log('❌ No passwordHash found for user:', email);
+      return res.status(401).json({ error: 'No password saved' });
+    }
+
+    const isMatch = await bcrypt.compare(password, userData.passwordHash);
+    console.log(`[LOGIN] Comparing password: ${password} → match=${isMatch}`);
+
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     const token = jwt.sign({ uid: userDoc.id }, process.env.JWT_SECRET!, { expiresIn: '7d' });
     return res.status(200).json({ token });
