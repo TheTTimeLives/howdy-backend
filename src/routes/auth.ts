@@ -6,8 +6,8 @@ import { db } from '../firebase';
 export const authRouter = express.Router();
 
 authRouter.post('/signup', async (req, res) => {
-  const { email, password, username } = req.body;
-  if (!email || !password || !username) {
+  const { email, password } = req.body;
+  if (!email || !password) {
     return res.status(400).json({ error: 'Missing fields' });
   }
 
@@ -27,7 +27,6 @@ authRouter.post('/signup', async (req, res) => {
     });
 
     await db.collection('user_metadata').doc(userId).set({
-      username,
       verificationStatus: 'awaiting',
       onboarded: false,
     });
