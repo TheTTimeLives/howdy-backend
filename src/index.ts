@@ -13,6 +13,8 @@ import { yotiRouter } from './routes/yoti';
 import { matchQueueRouter } from './routes/matchQueue';
 import { matchActionsRouter } from './routes/matchActions';
 import { agoraRouter } from './routes/agora';
+import { scheduledCallRouter } from './routes/scheduledCallRouter';
+import { pushRouter } from './routes/pushRouter';
 
 
 const app = express();
@@ -28,6 +30,8 @@ app.use('/yoti', yotiRouter);
 app.use('/matchQueue', matchQueueRouter);
 app.use('/match', matchActionsRouter);
 app.use('/agora', agoraRouter);
+app.use('/scheduled', scheduledCallRouter);
+app.use('/push', pushRouter);
 
 
 
