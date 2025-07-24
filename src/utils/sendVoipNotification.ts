@@ -1,20 +1,27 @@
 import { messaging, db } from '../firebase';
 
 export async function sendVoipNotification(uid: string, payload: any) {
+  console.log('📡 Attempting VoIP push to:', uid);
+
   const snap = await db.collection('users').doc(uid).collection('pushTokens').get();
   const tokens = snap.docs.map(d => d.id);
 
-  if (!tokens.length) return;
+  if (!tokens.length) {
+    console.warn('⚠️ No push tokens found for user:', uid);
+    return;
+  }
 
-  const msg = {
-  tokens,
+  console.log(`📲 Sending VoIP to ${tokens.length} device(s):`, tokens);
+
+  const messages = tokens.map(token => ({
+  token,
   notification: {
     title: payload.title,
     body: payload.body,
   },
   data: payload.data,
   android: {
-    priority: 'high' as const, // ✅ TypeScript literal cast
+    priority: 'high' as const, // ✅ FIX HERE
     notification: {
       channelId: 'call_channel',
       sound: 'default',
@@ -32,8 +39,23 @@ export async function sendVoipNotification(uid: string, payload: any) {
       },
     },
   },
-};
+}));
 
 
-  await messaging.sendMulticast(msg);
+  try {
+    const response = await messaging.sendEach(messages);
+    console.log('✅ VoIP push response:', response);
+
+    if (response.failureCount > 0) {
+      response.responses.forEach((resp, idx) => {
+        if (!resp.success) {
+          console.error(`❌ Token ${tokens[idx]} failed:`, resp.error);
+        }
+      });
+    }
+  } catch (err) {
+    console.error('❌ Failed to send push messages:', err);
+  }
 }
+
+
