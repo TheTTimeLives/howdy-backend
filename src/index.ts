@@ -15,9 +15,11 @@ import { matchActionsRouter } from './routes/matchActions';
 import { agoraRouter } from './routes/agora';
 import { scheduledCallRouter } from './routes/scheduledCallRouter';
 import { pushRouter } from './routes/pushRouter';
+import path from 'path';
 
 
 const app = express();
+app.use(express.static(path.join(__dirname, '../public')));
 app.use(cors());
 app.use(json());
 

@@ -1,0 +1,44 @@
+<!-- howdy-backend/public/yoti-error.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Verification Failed</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Optionally redirect to app with error handling -->
+  <!-- <meta http-equiv="refresh" content="5;url=howdy://verify-failure"> -->
+  <style>
+    body {
+      font-family: sans-serif;
+      text-align: center;
+      padding: 2em;
+      background: #fdf2f2;
+    }
+    .card {
+      background: white;
+      border-radius: 8px;
+      padding: 2rem;
+      max-width: 400px;
+      margin: 5rem auto;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+    }
+    h2 {
+      color: #b91c1c;
+    }
+    a {
+      display: inline-block;
+      margin-top: 1rem;
+      text-decoration: none;
+      color: #007aff;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>❌ Verification Failed</h2>
+    <p>Something went wrong during the process.</p>
+    <p>You may retry verification from the Howdy app.</p>
+    <a href="howdy://verify-failure">Return to app</a>
+  </div>
+</body>
+</html>

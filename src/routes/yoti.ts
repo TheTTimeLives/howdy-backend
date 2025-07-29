@@ -51,7 +51,12 @@ if (isSandbox) {
 }
 
 // 🛠️ Initialize Yoti IDVClient (uses API URL from env var internally)
-const idvClient = new IDVClient(YOTI_CLIENT_SDK_ID, YOTI_KEY, { apiUrl: 'https://api.yoti.com/sandbox/idverify/v1' });
+const idvClient = new IDVClient(YOTI_CLIENT_SDK_ID, YOTI_KEY, {
+  apiUrl: isSandbox
+    ? 'https://api.yoti.com/sandbox/idverify/v1'
+    : 'https://api.yoti.com/idverify/v1',
+});
+
 
 // 🔐 Secure Router
 export const yotiRouter = express.Router();
@@ -60,6 +65,9 @@ yotiRouter.use(verifyJwt);
 // POST /yoti/session
 yotiRouter.post('/session', async (req, res) => {
   const uid = String((req as any).uid ?? '');
+
+  console.log(`📦 Creating Yoti session for uid: ${uid}`);
+console.log(`🌍 Environment: ${isSandbox ? 'sandbox' : 'production'}`);
 
   try {
     const sdkConfig = new SdkConfigBuilder()
@@ -159,7 +167,7 @@ yotiRouter.post('/session', async (req, res) => {
       await sandboxClient.configureSessionResponse(sessionId, responseConfig);
     }
 
-    res.status(200).json({ sessionId, clientSessionToken });
+    res.status(200).json({ sessionId, clientSessionToken, isSandbox, });
   } catch (err) {
     console.error('❌ Failed to create Yoti session:', err);
     res.status(500).json({ error: 'Could not create Yoti session' });
@@ -192,6 +200,8 @@ yotiRouter.post('/webhook', async (req, res) => {
   }
 
   const { session_id, topic } = req.body;
+  console.log(`📩 Webhook received: session_id=${session_id}, topic=${topic}`);
+
   if (!session_id || !topic) {
     return res.status(400).json({ error: 'Missing session_id or topic' });
   }
@@ -199,32 +209,81 @@ yotiRouter.post('/webhook', async (req, res) => {
   try {
     if (topic === 'session_completion') {
       const sessionResult = await idvClient.getSession(session_id);
-      const checks = sessionResult.getChecks();
       const userId = sessionResult.getUserTrackingId();
 
+      const checks = sessionResult.getChecks();
       let approved = true;
+
       for (const check of checks) {
-        const recommendation = check.getReport().getRecommendation()?.getValue();
+        const recommendation = check.getReport()?.getRecommendation()?.getValue();
         if (recommendation !== 'APPROVE') {
           approved = false;
           break;
         }
       }
 
-      const newStatus = approved ? 'approved' : 'denied';
+      const update: Record<string, any> = {
+        verificationStatus: approved ? 'approved' : 'denied',
+      };
+
+      // Optional deduplication logic (only if approved)
+      if (approved) {
+        const textChecks = sessionResult.getIdDocumentTextDataChecks();
+        if (textChecks.length > 0) {
+          const check = textChecks[0];
+          const fields = (check as any).getDocumentFields?.();
+
+          let fullName: string | undefined;
+          let dob: string | undefined;
+          let docNum: string | undefined;
+
+          if (fields) {
+            fullName = fields.getField('full_name')?.getValue();
+            dob = fields.getField('date_of_birth')?.getValue();
+            docNum = fields.getField('document_number')?.getValue();
+          } else {
+            console.warn('⚠️ No document fields found in sandbox check.');
+          }
+
+          if (fullName && dob && docNum) {
+            const rawString = `${fullName}|${dob}|${docNum}`;
+            const crypto = await import('crypto');
+            const hash = crypto.createHash('sha256').update(rawString).digest('hex');
+
+            const existing = await db
+              .collection('user_metadata')
+              .where('identityHash', '==', hash)
+              .get();
+
+            if (!existing.empty) {
+              console.warn(`⚠️ Duplicate identity detected: ${fullName}, hash: ${hash}`);
+              update.verificationStatus = 'denied';
+              update.identityDuplicate = true;
+            } else {
+              update.identityHash = hash;
+            }
+          } else {
+            console.warn('⚠️ One or more identity fields are missing from document');
+          }
+        } else {
+          console.warn('⚠️ No ID document text checks found');
+        }
+      }
 
       if (userId) {
-        await db.collection('user_metadata').doc(userId).update({
-          verificationStatus: newStatus,
-        });
+        await db.collection('user_metadata').doc(userId).update(update);
+        console.log(`✅ Updated verification status for user ${userId}:`, update);
+      } else {
+        console.warn('⚠️ No userTrackingId found in session');
       }
 
       return res.status(200).json({ ok: true });
     }
 
+    console.log(`ℹ️ Ignoring non-session_completion topic: ${topic}`);
     res.status(200).json({ ignored: true });
-  } catch (e) {
-    console.error('❌ Failed to handle Yoti webhook:', e);
+  } catch (err) {
+    console.error('❌ Webhook handling failed:', err);
     res.status(500).json({ error: 'Webhook failed' });
   }
 });
