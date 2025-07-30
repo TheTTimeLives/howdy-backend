@@ -71,6 +71,8 @@ usersRouter.get('/me', async (req, res) => {
       onboarded: metadata?.onboarded ?? false,
       connectionCount: metadata?.connectionCount ?? 0,
       connectOutsidePreferences: metadata?.connectOutsidePreferences ?? false,
+      bioResponses: metadata?.bioResponses ?? {},
+      onboardingStage: metadata?.onboardingStage ?? 'bio',
     });
   } catch (e) {
     console.error('❌ Fetch error:', e);
@@ -152,24 +154,23 @@ usersRouter.get('/tenor/search', async (req, res) => {
 
 usersRouter.post('/metadata', async (req, res) => {
   const uid = (req as any).uid;
-  const { username, photoUrl } = req.body;
+  const { username, photoUrl, bioResponses, onboardingStage } = req.body;
 
-  if (!username || !photoUrl) {
-    return res.status(400).json({ error: 'Missing username or photoUrl' });
-  }
+// Check individual fields before merging
+const updatePayload: any = {};
+if (username) updatePayload.username = username;
+if (photoUrl) updatePayload.photoUrl = photoUrl;
+if (bioResponses) updatePayload.bioResponses = bioResponses;
+if (onboardingStage) updatePayload.onboardingStage = onboardingStage;
 
-  try {
-    await db.collection('user_metadata').doc(uid).set({
-      username,
-      photoUrl,
-      onboarded: true,
-    }, { merge: true }); // ✅ merge ensures it won’t overwrite unrelated fields
+try {
+  await db.collection('user_metadata').doc(uid).set(updatePayload, { merge: true });
+  return res.status(200).json({ ok: true });
+} catch (e) {
+  console.error('❌ Failed to update metadata:', e);
+  return res.status(500).json({ error: 'Failed to update user metadata' });
+}
 
-    return res.status(200).json({ ok: true });
-  } catch (e) {
-    console.error('❌ Failed to update metadata:', e);
-    return res.status(500).json({ error: 'Failed to update user metadata' });
-  }
 });
 
 usersRouter.post('/metadata', async (req, res) => {
