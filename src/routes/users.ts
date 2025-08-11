@@ -330,3 +330,101 @@ usersRouter.post('/review', verifyJwt, async (req, res) => {
     return res.status(500).json({ error: 'Failed to submit review' });
   }
 });
+
+// ---- Chi endpoints ----
+const DEFAULT_THRESHOLDS = (process.env.CHI_LEVEL_THRESHOLDS || '100,250,500,1000,2000')
+  .split(',')
+  .map((s) => parseInt(s.trim(), 10))
+  .filter((n) => !isNaN(n))
+  .sort((a, b) => a - b);
+
+function computeLevel(total: number): number {
+  let level = 0;
+  for (const t of DEFAULT_THRESHOLDS) {
+    if (total >= t) level += 1; else break;
+  }
+  return level;
+}
+
+usersRouter.get('/chi/me', verifyJwt, async (req, res) => {
+  const uid = (req as any).uid;
+  try {
+    const meta = await db.collection('user_metadata').doc(uid).get();
+    const data = meta.data() || {};
+    const chiTotal = data.chiTotal || 0;
+    const chiLevel = data.chiLevel || computeLevel(chiTotal);
+    const connectionsBank = data.connectionsBank || 0;
+    const nextIdx = DEFAULT_THRESHOLDS.find((t) => t > chiTotal);
+    return res.status(200).json({ chiTotal, chiLevel, connectionsBank, nextLevelAt: nextIdx ?? null });
+  } catch (e) {
+    console.error('❌ /users/chi/me failed:', e);
+    return res.status(500).json({ error: 'Failed to load chi' });
+  }
+});
+
+usersRouter.post('/chi/accrue', verifyJwt, async (req, res) => {
+  const uid = (req as any).uid;
+  const durationSec = Math.floor(Number(req.body?.durationSec || 0));
+  if (!durationSec || durationSec < 300) {
+    // Require at least 5 minutes
+    return res.status(200).json({ ok: true, awarded: 0, reason: 'min_duration' });
+  }
+
+  try {
+    let responsePayload: any = {};
+    await db.runTransaction(async (tx) => {
+      const ref = db.collection('user_metadata').doc(uid);
+      const snap = await tx.get(ref);
+      const data: any = snap.exists ? snap.data() : {};
+
+      // Daily multiplier logic
+      const now = new Date();
+      const todayKey = now.toISOString().slice(0, 10); // YYYY-MM-DD UTC
+      const lastKey = data.chiDailyKey as string | undefined;
+      let dailyCount = data.chiDailyCount as number | undefined;
+      if (!lastKey || lastKey !== todayKey) {
+        dailyCount = 0;
+      }
+      dailyCount = (dailyCount ?? 0) + 1; // count this completed call
+
+      const multiplier = 1 + Math.min(0.5, Math.max(0, dailyCount - 1) * 0.1); // +10% per additional call today, capped at +50%
+      const baseChi = Math.floor(durationSec / 60); // 1 chi per full minute
+      const awarded = Math.floor(baseChi * multiplier);
+
+      const prevTotal = data.chiTotal || 0;
+      const prevLevel = data.chiLevel ?? computeLevel(prevTotal);
+      const prevNextLevelAt = DEFAULT_THRESHOLDS.find((t) => t > prevTotal) ?? null;
+
+      const newTotal = prevTotal + awarded;
+      const newLevel = computeLevel(newTotal);
+      const newNextLevelAt = DEFAULT_THRESHOLDS.find((t) => t > newTotal) ?? null;
+      const levelUps = Math.max(0, newLevel - prevLevel);
+      const prevBank = data.connectionsBank || 0;
+
+      tx.set(ref, {
+        chiTotal: newTotal,
+        chiLevel: newLevel,
+        connectionsBank: prevBank + levelUps,
+        chiDailyKey: todayKey,
+        chiDailyCount: dailyCount,
+      }, { merge: true });
+
+      responsePayload = {
+        ok: true,
+        awarded,
+        multiplier,
+        prevTotal,
+        newTotal,
+        prevLevel,
+        newLevel,
+        prevNextLevelAt,
+        newNextLevelAt,
+      };
+    });
+
+    return res.status(200).json(responsePayload);
+  } catch (e) {
+    console.error('❌ /users/chi/accrue failed:', e);
+    return res.status(500).json({ error: 'Failed to accrue chi' });
+  }
+});
