@@ -33,15 +33,18 @@ matchActionsRouter.post('/accept', async (req, res) => {
       channelName: data.channelName,
       active: true,
       startedAt: Date.now(),
+      topicA: data.prefs?.topic || data.topic || null,
+      topicB: partnerData?.prefs?.topic || partnerData?.topic || null,
     });
 
     const callId = callRef.id;
 
-    const callHistoryEntry = (partnerId: string, channelName: string) => ({
+    const callHistoryEntry = (partnerId: string, channelName: string, topic?: string) => ({
       partnerId,
       channelName,
       timestamp: Date.now(),
       reviewed: false, // ✅ Added field
+      topic: typeof topic === 'string' ? topic : null,
     });
 
     await Promise.all([
@@ -69,14 +72,14 @@ matchActionsRouter.post('/accept', async (req, res) => {
         .doc('history')
         .collection('calls')
         .doc(callId)
-        .set(callHistoryEntry(data.partnerId, data.channelName)),
+        .set(callHistoryEntry(data.partnerId, data.channelName, data.prefs?.topic || data.topic)),
       db.collection('users')
         .doc(data.partnerId)
         .collection('user-metadata')
         .doc('history')
         .collection('calls')
         .doc(callId)
-        .set(callHistoryEntry(uid, data.channelName)),
+        .set(callHistoryEntry(uid, data.channelName, partnerData?.prefs?.topic || partnerData?.topic)),
     ]);
 
     console.log('✅ Match completed between', uid, 'and', data.partnerId);

@@ -6,7 +6,7 @@ import { db } from '../firebase';
 export const authRouter = express.Router();
 
 authRouter.post('/signup', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, groupCodes } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'Missing fields' });
   }
@@ -26,9 +26,16 @@ authRouter.post('/signup', async (req, res) => {
       passwordHash: hash,
     });
 
+    const initialGroupCodes: string[] = Array.isArray(groupCodes)
+      ? groupCodes.filter((c: any) => typeof c === 'string' && c.trim().length > 0)
+      : (typeof groupCodes === 'string' && groupCodes.trim().length > 0
+          ? [groupCodes.trim()]
+          : []);
+
     await db.collection('user_metadata').doc(userId).set({
       verificationStatus: 'awaiting',
       onboarded: false,
+      groupCodes: initialGroupCodes,
     });
 
     const token = jwt.sign({ uid: userId }, process.env.JWT_SECRET!, { expiresIn: '7d' });

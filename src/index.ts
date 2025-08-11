@@ -37,7 +37,10 @@ app.use('/push', pushRouter);
 
 
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+const PORT = Number(process.env.PORT) || 5000;
+const HOST = '0.0.0.0';
+
+app.listen(PORT, HOST, () => {
+  console.log(`🚀 Backend is live at http://${HOST}:${PORT}`);
+  console.log('🌐 If running on real device, use your machine\'s local IP.');
 });

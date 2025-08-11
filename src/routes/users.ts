@@ -73,6 +73,10 @@ usersRouter.get('/me', async (req, res) => {
       connectOutsidePreferences: metadata?.connectOutsidePreferences ?? false,
       bioResponses: metadata?.bioResponses ?? {},
       onboardingStage: metadata?.onboardingStage ?? 'bio',
+      groupCodes: metadata?.groupCodes ?? [],
+      themeMode: metadata?.themeMode ?? null,
+      textScale: metadata?.textScale ?? null,
+      currentPrompt: metadata?.currentPrompt ?? null,
     });
   } catch (e) {
     console.error('❌ Fetch error:', e);
@@ -96,17 +100,18 @@ usersRouter.post('/verification/reset', async (req, res) => {
 
 usersRouter.post('/preferences', async (req, res) => {
   const uid = (req as any).uid;
-  const { joinedPools, blockedCategories } = req.body;
+  const { joinedPools, blockedCategories, groupCodes } = req.body;
 
   if (!Array.isArray(joinedPools) || !Array.isArray(blockedCategories)) {
     return res.status(400).json({ error: 'Invalid format' });
   }
 
   try {
-    await db.collection('user_metadata').doc(uid).update({
-      joinedPools,
-      blockedCategories,
-    });
+    const update: any = { joinedPools, blockedCategories };
+    if (Array.isArray(groupCodes)) {
+      update.groupCodes = groupCodes.filter((c: any) => typeof c === 'string');
+    }
+    await db.collection('user_metadata').doc(uid).update(update);
 
     res.status(200).json({ ok: true });
   } catch (e) {
@@ -154,7 +159,7 @@ usersRouter.get('/tenor/search', async (req, res) => {
 
 usersRouter.post('/metadata', async (req, res) => {
   const uid = (req as any).uid;
-  const { username, photoUrl, bioResponses, onboardingStage } = req.body;
+  const { username, photoUrl, bioResponses, onboardingStage, themeMode, textScale, groupCodes, currentPrompt, connectOutsidePreferences } = req.body;
 
 // Check individual fields before merging
 const updatePayload: any = {};
@@ -162,6 +167,11 @@ if (username) updatePayload.username = username;
 if (photoUrl) updatePayload.photoUrl = photoUrl;
 if (bioResponses) updatePayload.bioResponses = bioResponses;
 if (onboardingStage) updatePayload.onboardingStage = onboardingStage;
+ if (themeMode) updatePayload.themeMode = themeMode;
+ if (typeof textScale === 'number') updatePayload.textScale = textScale;
+ if (Array.isArray(groupCodes)) updatePayload.groupCodes = groupCodes.filter((c: any) => typeof c === 'string');
+ if (typeof currentPrompt === 'string') updatePayload.currentPrompt = currentPrompt;
+ if (typeof connectOutsidePreferences === 'boolean') updatePayload.connectOutsidePreferences = connectOutsidePreferences;
 
 try {
   await db.collection('user_metadata').doc(uid).set(updatePayload, { merge: true });
