@@ -74,9 +74,15 @@ usersRouter.get('/me', async (req, res) => {
       bioResponses: metadata?.bioResponses ?? {},
       onboardingStage: metadata?.onboardingStage ?? 'bio',
       groupCodes: metadata?.groupCodes ?? [],
+      accountType: metadata?.accountType ?? 'individual',
+      primaryGroupId: metadata?.primaryGroupId ?? null,
       themeMode: metadata?.themeMode ?? null,
       textScale: metadata?.textScale ?? null,
       currentPrompt: metadata?.currentPrompt ?? null,
+      mfa: metadata?.mfa ? {
+        required: !!metadata?.mfa?.required,
+        methods: Array.isArray(metadata?.mfa?.methods) ? metadata?.mfa?.methods : [],
+      } : { required: false, methods: [] },
     });
   } catch (e) {
     console.error('❌ Fetch error:', e);
