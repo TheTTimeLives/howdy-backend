@@ -6,13 +6,11 @@ import cors from 'cors';
 import { json } from 'body-parser';
 import { authRouter } from './routes/auth';
 import { enqueueRouter } from './routes/enqueue';
-import { tokenRouter } from './routes/token';
 import { usersRouter } from './routes/users';
 import { categoriesRouter } from './routes/categories';
 import { yotiRouter } from './routes/yoti';
 import { matchQueueRouter } from './routes/matchQueue';
 import { matchActionsRouter } from './routes/matchActions';
-import { agoraRouter } from './routes/agora';
 import { scheduledCallRouter } from './routes/scheduledCallRouter';
 import { groupsRouter } from './routes/groups';
 import { pushRouter } from './routes/pushRouter';
@@ -21,15 +19,20 @@ import path from 'path';
 import { billingRouter } from './routes/billing';
 import Stripe from 'stripe';
 import crypto from 'crypto';
-
+import { onboardingRouter } from './routes/onboarding';
+import { callsRouter, assemblyAiWebhookHandler } from './routes/calls';
 
 const app = express();
 
 // --- Raw-body webhook endpoints (must be before json()) ---
+
+// AssemblyAI webhook (JSON body; not JWT-protected)
+app.post('/webhooks/assemblyai', express.json({ limit: '20mb' }), assemblyAiWebhookHandler);
+
 // Stripe webhook
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2023-10-16' });
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2022-11-15' });
     const sig = req.headers['stripe-signature'] as string;
     const secret = process.env.STRIPE_WEBHOOK_SECRET || '';
     let event;
@@ -75,10 +78,10 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
 app.post('/webhooks/revenuecat', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const signature = String(req.header('X-RevenueCat-Signature') || '');
-    const secret = process.env.REVENUECAT_WEBHOOK_SECRET || '';
-    if (!verifyRevenueCatSignature(req.body, signature, secret)) {
-      return res.status(400).send('Invalid signature');
-    }
+    // const secret = process.env.REVENUECAT_WEBHOOK_SECRET || '';
+    // if (!verifyRevenueCatSignature(req.body, signature, secret)) {
+    //   return res.status(400).send('Invalid signature');
+    // }
     const payload = JSON.parse(req.body.toString('utf8'));
     const appUserId: string | undefined = payload?.app_user_id;
     // Derive entitlement active/tier (payload schema may vary by event)
@@ -131,21 +134,19 @@ app.use(cors());
 app.use(json());
 
 app.use('/enqueue', enqueueRouter);
-app.use('/calls/token', tokenRouter);
+app.use('/calls', callsRouter);
 app.use('/users', usersRouter);
 app.use('/auth', authRouter);
 app.use('/categories', categoriesRouter);
 app.use('/yoti', yotiRouter);
 app.use('/matchQueue', matchQueueRouter);
 app.use('/match', matchActionsRouter);
-app.use('/agora', agoraRouter);
 app.use('/scheduled', scheduledCallRouter);
 app.use('/push', pushRouter);
 app.use('/groups', groupsRouter);
 app.use('/subscriptions', subscriptionsRouter);
 app.use('/billing', billingRouter);
-
-
+app.use('/onboarding', onboardingRouter);
 
 const PORT = Number(process.env.PORT) || 5000;
 const HOST = '0.0.0.0';

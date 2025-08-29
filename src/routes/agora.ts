@@ -1,4 +1,4 @@
-// ✅ Updated /routes/agoraRouter.ts\ 
+// deprectaed
 import express from 'express';
 import { RtcTokenBuilder, RtcRole } from 'agora-access-token';
 import { verifyJwt } from '../verifyJwt';

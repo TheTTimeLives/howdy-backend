@@ -1,3 +1,5 @@
+// deprecated
+
 import express from 'express';
 import { verifyJwt } from '../verifyJwt';
 import { RtcTokenBuilder, RtcRole } from 'agora-access-token';

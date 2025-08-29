@@ -127,6 +127,7 @@ usersRouter.post('/preferences', async (req, res) => {
 });
 
 usersRouter.get('/tenor/search', async (req, res) => {
+  console.log('🔍 Tenor search request:', req.query);
   const { q, limit } = req.query;
 
   if (!q || typeof q !== 'string') {
@@ -155,6 +156,7 @@ usersRouter.get('/tenor/search', async (req, res) => {
       result?.media_formats?.tinygifpreview?.url
     ).filter((url: string | null) => !!url);
 
+    console.log('🔍 Tenor search response:', { gifs });
     res.status(200).json({ gifs });
   } catch (e) {
     console.error('❌ Tenor search failed:', e);

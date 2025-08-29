@@ -37,6 +37,22 @@ function verifyTotpBase32WithWindow(secretBase32: string, token: string, windowS
   }
 }
 
+/**
+ * Validate password complexity.
+ * Rules: 8–128 chars, no spaces, at least 1 upper, 1 lower, 1 digit, 1 special.
+ */
+function validatePasswordComplexity(password: unknown): string | null {
+  const p = typeof password === 'string' ? password : '';
+  if (!p) return 'Missing password';
+  if (p.length < 8 || p.length > 128) return 'Password must be 8–128 characters';
+  if (/\s/.test(p)) return 'Password cannot contain spaces';
+  if (!/[A-Z]/.test(p)) return 'Password must include an uppercase letter';
+  if (!/[a-z]/.test(p)) return 'Password must include a lowercase letter';
+  if (!/[0-9]/.test(p)) return 'Password must include a number';
+  if (!/[!@#$%^&*()\-_=+\[\]{};:'",.<>\/?`~|\\]/.test(p)) return 'Password must include a special character';
+  return null;
+}
+
 // --------- AUTH: SIGNUP ---------
 authRouter.post('/signup', async (req, res) => {
   const rawEmail = req.body?.email;
@@ -47,6 +63,11 @@ authRouter.post('/signup', async (req, res) => {
   const email = toEmail(rawEmail);
   if (!email || !password) {
     return res.status(400).json({ error: 'Missing fields' });
+  }
+
+  const pwErr = validatePasswordComplexity(password);
+  if (pwErr) {
+    return res.status(400).json({ error: pwErr });
   }
 
   try {
@@ -136,7 +157,7 @@ authRouter.post('/login', async (req, res) => {
     const snapshot = await db.collection('users').where('email', '==', email).get();
     if (snapshot.empty) {
       console.log('❌ No user found for email:', email);
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json({ error: 'Invalid email or password' });
     }
 
     const userDoc = snapshot.docs[0];
@@ -151,7 +172,7 @@ authRouter.post('/login', async (req, res) => {
     console.log(`[LOGIN] match=${isMatch} email=${email}`);
 
     if (!isMatch) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return res.status(401).json({ error: 'Invalid email or password' });
     }
 
     const meta = await db.collection('user_metadata').doc(userDoc.id).get();
@@ -188,24 +209,35 @@ authRouter.post('/forgot-password', async (req, res) => {
 
     const userDoc = snapshot.docs[0];
     const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = Date.now() + 1000 * 60 * 30; // 30 minutes
+    const expiresAt = Date.now() + 6 * 60 * 60 * 1000; // 6 hours
 
-    await db.collection('password_resets').doc(userDoc.id).set({
-      token,
-      expiresAt,
-    });
+    await db.collection('password_resets').doc(userDoc.id).set({ token, expiresAt });
+    await db.collection('password_resets').doc(token).set({ uid: userDoc.id, expiresAt });
 
-    const appDeepLink = `howdy://reset-password?token=${token}&uid=${userDoc.id}`;
     const backendBase = process.env.BACKEND_BASE_URL || 'http://localhost:5000';
-    const webFallback = `${backendBase}/auth/reset-password?token=${token}&uid=${userDoc.id}`;
+    const webUrl = `${backendBase}/auth/reset-password?token=${token}&uid=${userDoc.id}`;
     await sendEmail(
       email,
       'Reset your Howdy password',
-      `Open the app to reset your password: ${appDeepLink}\n\nIf the app does not open, use this web link: ${webFallback}`,
-      `<p><strong>Reset via the app (preferred):</strong></p>
-       <p><a href="${appDeepLink}">${appDeepLink}</a></p>
-       <p style="margin-top:16px"><strong>Or reset on the web:</strong></p>
-       <p><a href="${webFallback}">${webFallback}</a></p>`
+      `Click here to reset your password.`,
+      `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;font-size:14px;color:#222;line-height:1.5">
+        <p>Hi,</p>
+        <p>We received a request to reset your Howdy password. Click the button below to continue.</p>
+        <p>
+          <a href="${webUrl}" style="
+            display:inline-block;
+            background:#d37f1c;
+            color:#fff;
+            padding:12px 16px;
+            border-radius:8px;
+            text-decoration:none;
+            font-weight:600;">
+            Reset your password
+          </a>
+        </p>
+        <p>This link will expire in 30 minutes. If you didn’t request a password reset, you can safely ignore this email.</p>
+        <p>Thanks,<br/>The Howdy Team</p>
+      </div>`
     );
 
     return res.status(200).json({ ok: true });
@@ -221,16 +253,36 @@ authRouter.post('/reset-password', async (req, res) => {
     return res.status(400).json({ error: 'Missing fields' });
   }
 
+  const pwErr = validatePasswordComplexity(password);
+  if (pwErr) {
+    return res.status(400).json({ error: pwErr });
+  }
+
   try {
-    const resetDoc = await db.collection('password_resets').doc(uid).get();
-    const data = resetDoc.data();
-    if (!data || data.token !== token || typeof data.expiresAt !== 'number' || Date.now() > data.expiresAt) {
+    // Prefer token-keyed doc for validation to allow multiple outstanding links
+    const tokenDoc = await db.collection('password_resets').doc(token).get();
+    let valid = false;
+    if (tokenDoc.exists) {
+      const tdata = tokenDoc.data() as any;
+      if (tdata && tdata.uid === uid && typeof tdata.expiresAt === 'number' && Date.now() <= tdata.expiresAt) {
+        valid = true;
+      }
+    } else {
+      const resetDoc = await db.collection('password_resets').doc(uid).get();
+      const data = resetDoc.data() as any;
+      if (data && data.token === token && typeof data.expiresAt === 'number' && Date.now() <= data.expiresAt) {
+        valid = true;
+      }
+    }
+    if (!valid) {
       return res.status(400).json({ error: 'Invalid or expired reset link' });
     }
 
     const hash = await bcrypt.hash(password, 10);
     await db.collection('users').doc(uid).update({ passwordHash: hash });
-    await db.collection('password_resets').doc(uid).delete();
+    // Clean up both potential records
+    await db.collection('password_resets').doc(uid).delete().catch(() => {});
+    await db.collection('password_resets').doc(token).delete().catch(() => {});
 
     return res.status(200).json({ ok: true });
   } catch (e) {
@@ -471,7 +523,9 @@ authRouter.get('/reset-password', async (req, res) => {
         .card { max-width:480px; margin: 40px auto; background:#fff; border:1px solid #e6e6eb; border-radius:12px; padding:20px; }
         label { display:block; margin:12px 0 6px; font-weight:600; }
         input { width:100%; padding:10px; border:1px solid #c9c9cf; border-radius:8px; }
-        button { width:100%; margin-top:16px; padding:12px; border:0; border-radius:10px; background:#1a73e8; color:#fff; font-weight:600; }
+        button { width:100%; margin-top:16px; padding:12px; border:0; border-radius:10px; background:#d37f1c; color:#fff; font-weight:600; cursor:pointer; transition: background-color .15s ease, opacity .15s ease; }
+        button:hover:not(:disabled) { background:#b86f18; }
+        button:disabled { opacity:.6; cursor:not-allowed; }
         .msg { margin-top:12px; }
         .err { color:#c62828; }
         .ok { color:#2e7d32; }
@@ -483,24 +537,88 @@ authRouter.get('/reset-password', async (req, res) => {
         <p>Enter a new password for your account.</p>
         <label>New password</label>
         <input id="p1" type="password" />
+        <button id="toggleP1" type="button" style="
+          width:auto; margin-top:6px; padding:4px 0; background:transparent; border:0; color:#555; text-decoration:underline; cursor:pointer;
+        ">Show password</button>
         <label>Confirm password</label>
         <input id="p2" type="password" />
+        <button id="toggleP2" type="button" style="
+          width:auto; margin-top:6px; padding:4px 0; background:transparent; border:0; color:#555; text-decoration:underline; cursor:pointer;
+        ">Show password</button>
         <button id="submit">Reset password</button>
         <div id="msg" class="msg"></div>
+        <div id="pwChecks" style="font-size:13px; margin-top:8px">
+          <div id="pwLen"><span class="sym">•</span> 8–128 characters</div>
+          <div id="pwSpace"><span class="sym">•</span> No spaces</div>
+          <div id="pwUpper"><span class="sym">•</span> Uppercase letter</div>
+          <div id="pwLower"><span class="sym">•</span> Lowercase letter</div>
+          <div id="pwDigit"><span class="sym">•</span> Number</div>
+          <div id="pwSpecial"><span class="sym">•</span> Special character</div>
+          <div id="pwMatch"><span class="sym">•</span> Passwords match</div>
+        </div>
       </div>
       <script>
         const el = (id) => document.getElementById(id);
-        el('submit').addEventListener('click', async () => {
+        const setReq = (id, ok) => {
+          const node = el(id);
+          const sym = node.querySelector('.sym');
+          if (sym) sym.textContent = ok ? '✓' : '•';
+          node.style.color = ok ? '#2e7d32' : '#222';
+          node.style.fontWeight = ok ? '600' : '400';
+        };
+        const requirements = () => {
+          const p1 = el('p1').value;
+          const p2 = el('p2').value;
+          const lenOk = p1.length >= 8 && p1.length <= 128;
+          const noSpace = !/\\s/.test(p1);
+          const upper = /[A-Z]/.test(p1);
+          const lower = /[a-z]/.test(p1);
+          const digit = /[0-9]/.test(p1);
+          const special = /[^A-Za-z0-9\\s]/.test(p1);
+          const match = p1.length > 0 && p1 === p2;
+          return { lenOk, noSpace, upper, lower, digit, special, match };
+        };
+        const submitBtn = el('submit');
+        const updateChecklist = () => {
+          const r = requirements();
+          setReq('pwLen', r.lenOk);
+          setReq('pwSpace', r.noSpace);
+          setReq('pwUpper', r.upper);
+          setReq('pwLower', r.lower);
+          setReq('pwDigit', r.digit);
+          setReq('pwSpecial', r.special);
+          setReq('pwMatch', r.match);
+          submitBtn.disabled = !(r.lenOk && r.noSpace && r.upper && r.lower && r.digit && r.special && r.match);
+        };
+        ['p1','p2'].forEach(id => el(id).addEventListener('input', updateChecklist));
+        const setupToggle = (inputId, btnId) => {
+          const inp = el(inputId);
+          const btn = el(btnId);
+          btn.addEventListener('click', () => {
+            const isPwd = inp.getAttribute('type') === 'password';
+            inp.setAttribute('type', isPwd ? 'text' : 'password');
+            btn.textContent = isPwd ? 'Hide password' : 'Show password';
+          });
+        };
+        setupToggle('p1','toggleP1');
+        setupToggle('p2','toggleP2');
+        updateChecklist();
+        submitBtn.addEventListener('click', async () => {
           const p1 = el('p1').value.trim();
           const p2 = el('p2').value.trim();
           const msg = el('msg');
           msg.textContent = '';
           msg.className = 'msg';
-          if (!p1 || p1 !== p2) {
-            msg.textContent = 'Passwords do not match';
+          // Final guard on the client (server also validates)
+          const r = requirements();
+          if (!(r.lenOk && r.noSpace && r.upper && r.lower && r.digit && r.special && r.match)) {
+            msg.textContent = 'Please meet all password requirements';
             msg.classList.add('err');
             return;
           }
+          submitBtn.disabled = true;
+          const prevText = submitBtn.textContent;
+          submitBtn.textContent = 'Resetting…';
           try {
             const r = await fetch('/auth/reset-password', {
               method: 'POST',
@@ -508,16 +626,22 @@ authRouter.get('/reset-password', async (req, res) => {
               body: JSON.stringify({ uid: '${uid}', token: '${token}', password: p1 })
             });
             if (r.ok) {
-              msg.textContent = 'Password updated. You can now sign in in the app.';
+              msg.textContent = 'Password updated. You can now sign into the app.';
               msg.classList.add('ok');
+              submitBtn.textContent = 'Password updated';
+              submitBtn.disabled = true; // keep disabled after success
             } else {
               const data = await r.json().catch(() => ({}));
               msg.textContent = data.error || 'Reset failed';
               msg.classList.add('err');
+              submitBtn.textContent = prevText;
+              submitBtn.disabled = false; // allow retry on error
             }
           } catch (e) {
             msg.textContent = 'Network error';
             msg.classList.add('err');
+            submitBtn.textContent = prevText;
+            submitBtn.disabled = false;
           }
         });
       </script>

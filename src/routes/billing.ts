@@ -4,7 +4,7 @@ import { verifyJwt } from '../verifyJwt';
 
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY || '';
 const stripe = new Stripe(stripeSecretKey, {
-  apiVersion: '2023-10-16',
+  apiVersion: '2022-11-15',
 });
 
 export const billingRouter = express.Router();
