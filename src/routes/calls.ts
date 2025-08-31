@@ -39,7 +39,7 @@ const AGORA_RECORDING_CHANNEL_TYPE = Number(process.env.AGORA_RECORDING_CHANNEL_
 const RECORDER_ROLE =
   (process.env.AGORA_RECORDER_ROLE || 'PUBLISHER').toUpperCase() === 'SUBSCRIBER'
     ? RtcRole.SUBSCRIBER
-    : RtcRole.PUBLISHER; // default PUBLISHER (more permissive in many apps)
+    : RtcRole.PUBLISHER; // default PUBLISHER
 
 // GCS bucket + prefixes
 const GCS_BUCKET = process.env.GCS_BUCKET || '';
@@ -66,6 +66,8 @@ const storage = new Storage();
 
 // ========= Lock settings =========
 const START_LOCK_TTL_MS = Number(process.env.REC_START_LOCK_TTL_MS || 30000); // 30s default
+const STOP_LOCK_TTL_MS = Number(process.env.REC_STOP_LOCK_TTL_MS || 30000);   // stop lock
+const SUBMIT_LOCK_TTL_MS = Number(process.env.TRANSCRIBE_SUBMIT_LOCK_TTL_MS || 30000); // submit lock
 
 // === Helpers ===
 function channelDocRef(channelName: string) {
@@ -163,7 +165,64 @@ callsRouter.post('/start', async (req, res) => {
     if (!channelName) return res.status(400).json({ error: 'Missing channelName' });
 
     await ensureCallDoc(channelName, [caller, ...participants]);
-    return res.json({ ok: true });
+
+    // Auto-start recording with race-proof logic
+    let lockId: string | null = null;
+    try {
+      if (!/^\d+$/.test(RECORDER_UID)) {
+        return res.status(500).json({ error: 'Configured RECORDER_UID must be numeric' });
+      }
+      if (!AGORA_REC_CUSTOMER_ID || !AGORA_REC_CUSTOMER_CERT) {
+        return res.status(500).json({ error: 'Missing Agora Cloud Recording REST credentials' });
+      }
+      if (!GCS_BUCKET || !GCS_INTEROP_ACCESS_KEY || !GCS_INTEROP_SECRET_KEY) {
+        return res.status(500).json({ error: 'Missing GCS bucket or interoperability keys' });
+      }
+
+      // Fast path: already active?
+      const ref = channelDocRef(channelName);
+      const existingSnap = await ref.get();
+      const existingRec = existingSnap.data()?.rec;
+      if (existingRec?.sid && !existingRec?.stoppedAt) {
+        return res.json({ ok: true, recording: { resourceId: existingRec.resourceId, sid: existingRec.sid, alreadyActive: true } });
+      }
+
+      try {
+        lockId = await acquireStartLock(channelName, caller);
+      } catch (e: any) {
+        if (e?.message === 'ALREADY_ACTIVE') {
+          const s2 = await ref.get();
+          const r2 = s2.data()?.rec;
+          return res.json({ ok: true, recording: { resourceId: r2?.resourceId, sid: r2?.sid, alreadyActive: true } });
+        }
+        if (e?.message === 'ALREADY_STARTING') {
+          return res.status(202).json({ ok: true, recording: { starting: true } });
+        }
+        throw e;
+      }
+
+      const { segments, objectPathBase } = await buildRecordingPrefix(channelName);
+      const { token: recorderToken } = buildRecorderToken(channelName);
+      try {
+        const { resourceId, sid } = await startRecordingToGCS(
+          channelName,
+          RECORDER_UID,
+          segments,
+          objectPathBase,
+          recorderToken
+        );
+        return res.json({ ok: true, recording: { resourceId, sid } });
+      } catch (err) {
+        await ref.set({ rec: { startErrorAt: nowMs(), startError: String(err) } }, { merge: true });
+        console.error('⚠️ Failed to auto-start recording at /calls/start', err);
+        return res.json({ ok: true, recording: { started: false } });
+      } finally {
+        if (lockId) await releaseStartLock(channelName, lockId);
+      }
+    } catch (e) {
+      console.error('❌ /calls/start recording block error', e);
+      return res.json({ ok: true, recording: { started: false } });
+    }
   } catch (e) {
     console.error('❌ /calls/start error', e);
     return res.status(500).json({ error: 'Internal Error' });
@@ -198,6 +257,7 @@ callsRouter.post('/:channelName/end', async (req, res) => {
     const { reason } = req.body || {};
     const ref = channelDocRef(channelName);
 
+    // Mark call inactive (idempotent)
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       if (!snap.exists) return;
@@ -215,6 +275,75 @@ callsRouter.post('/:channelName/end', async (req, res) => {
         { merge: true }
       );
     });
+
+    // Stop recording once (stop lock)
+    let stopLockId: string | null = null;
+    try {
+      stopLockId = await acquireStopLock(channelName, ender);
+      const snap = await ref.get();
+      const rec = snap.data()?.rec;
+
+      if (!rec?.resourceId || !rec?.sid) {
+        // nothing to stop (or already cleared)
+      } else {
+        const recorderUid: string = String(rec.recorderUid || RECORDER_UID);
+        if (/^\d+$/.test(recorderUid)) {
+          try {
+            await stopRecording(rec.resourceId, rec.sid, channelName, recorderUid);
+          } catch (e) {
+            console.warn('⚠️ stopRecording failed (ignored):', e);
+          }
+          await ref.set({ rec: { ...rec, stoppedAt: Date.now() } }, { merge: true });
+        }
+      }
+    } catch (e: any) {
+      if (e?.message === 'ALREADY_STOPPED') {
+        // already done
+      } else if (e?.message === 'ALREADY_STOPPING') {
+        // someone else is stopping
+      } else {
+        console.warn('⚠️ Failed to acquire stop lock:', e);
+      }
+    } finally {
+      if (stopLockId) await releaseStopLock(channelName, stopLockId);
+    }
+
+    // Schedule transcription exactly once
+    let shouldSchedule = false;
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (!snap.exists) return;
+      const data = snap.data() || {};
+      const tr = data.transcription || {};
+      const status = String(tr.status || '');
+
+      if (tr.submitScheduledAt) return; // already scheduled
+      if (['submitted', 'processing', 'completed'].includes(status) && tr.id) return; // already submitted
+
+      shouldSchedule = true;
+      tx.set(
+        ref,
+        { transcription: { ...tr, submitScheduledAt: Date.now(), submitScheduledBy: ender } },
+        { merge: true }
+      );
+    });
+
+    if (shouldSchedule) {
+      setTimeout(async () => {
+        try {
+          const base = process.env.API_BASE_URL || '';
+          if (!base) return;
+          const fetchDyn = (await import('node-fetch')).default as any;
+          await fetchDyn(`${base}/calls/${encodeURIComponent(channelName)}/transcribe`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: req.headers.authorization || '' },
+            body: '{}',
+          });
+        } catch (e) {
+          console.warn('⚠️ Failed to submit transcription at call end', e);
+        }
+      }, 30_000);
+    }
 
     return res.json({ ok: true });
   } catch (e) {
@@ -242,9 +371,11 @@ async function buildRecordingPrefix(channelName: string): Promise<{ segments: st
     const parts: string[] = Array.from(new Set([...(snap.data()?.participants || [])]))
       .map((x: any) => String(x || '').trim())
       .filter((x: string) => x.length > 0);
+    // Always use alphabetically sorted document IDs so the prefix is stable
     if (parts.length >= 2) {
-      const sorted = parts.slice(0, 2).sort();
-      [a, b] = sorted;
+      const sortedAll = parts.slice().sort((s1, s2) => s1.localeCompare(s2));
+      a = sortedAll[0];
+      b = sortedAll[1];
     } else if (parts.length === 1) {
       a = parts[0];
       b = 'unknown';
@@ -320,6 +451,8 @@ async function startRecordingToGCS(
     },
   };
 
+  // ✅ Ask Agora to write MP4 (and HLS due to GCS quirk noted)
+  // DON'T REMOVE HLS IT IS A CURRENT BUG WITH USING GCP FOR AGORA STORAGE
   const recordingFileConfig = { avFileType: ['mp4', 'hls'] };
 
   const storageConfig = {
@@ -428,7 +561,7 @@ async function queryRecording(resourceId: string, sid: string, channelName: stri
   return data;
 }
 
-// ========= Start lock (race-proof) =========
+// ========= Start/Stop/Submit locks =========
 function nowMs() {
   return Date.now();
 }
@@ -484,7 +617,84 @@ async function releaseStartLock(channelName: string, lockId: string) {
   });
 }
 
-// START recording (server endpoint called after users joined; call exactly once)
+async function acquireStopLock(channelName: string, ownerUid: string): Promise<string> {
+  const ref = channelDocRef(channelName);
+  const lockId = Math.random().toString(36).slice(2);
+  const now = nowMs();
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new Error('NO_CALL_DOC');
+
+    const data = snap.data() || {};
+    const rec = data.rec || {};
+
+    if (rec.stoppedAt) throw new Error('ALREADY_STOPPED');
+
+    const lock = rec.stopLock;
+    const lockFresh = lock && now - (lock.at || 0) < STOP_LOCK_TTL_MS;
+    if (lockFresh) throw new Error('ALREADY_STOPPING');
+
+    tx.set(ref, { rec: { ...rec, stopLock: { id: lockId, owner: ownerUid, at: now } } }, { merge: true });
+  });
+
+  return lockId;
+}
+
+async function releaseStopLock(channelName: string, lockId: string) {
+  const ref = channelDocRef(channelName);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return;
+    const data = snap.data() || {};
+    const rec = data.rec || {};
+    if (rec.stopLock?.id === lockId) {
+      tx.update(ref, { 'rec.stopLock': FieldValue.delete() });
+    }
+  });
+}
+
+async function acquireSubmitLock(channelName: string, ownerUid: string): Promise<string> {
+  const ref = channelDocRef(channelName);
+  const lockId = Math.random().toString(36).slice(2);
+  const now = nowMs();
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new Error('NO_CALL_DOC');
+
+    const data = snap.data() || {};
+    const tr = data.transcription || {};
+
+    // Already submitted/processing/completed? Don't acquire.
+    const status = String(tr.status || '');
+    if (['submitted', 'processing', 'completed'].includes(status) && tr.id) {
+      throw new Error('ALREADY_SUBMITTED');
+    }
+
+    const lock = tr.submitLock;
+    const lockFresh = lock && now - (lock.at || 0) < SUBMIT_LOCK_TTL_MS;
+    if (lockFresh) throw new Error('ALREADY_SUBMITTING');
+
+    tx.set(ref, { transcription: { ...tr, submitLock: { id: lockId, owner: ownerUid, at: now } } }, { merge: true });
+  });
+
+  return lockId;
+}
+
+async function releaseSubmitLock(channelName: string, lockId: string) {
+  const ref = channelDocRef(channelName);
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return;
+    const tr = (snap.data() || {}).transcription || {};
+    if (tr.submitLock?.id === lockId) {
+      tx.update(ref, { 'transcription.submitLock': FieldValue.delete() });
+    }
+  });
+}
+
+// START recording (manual endpoint if you ever call it)
 callsRouter.post('/:channelName/record/start', async (req, res) => {
   const authUid = String((req as any).uid || '');
   const { channelName } = req.params;
@@ -540,10 +750,8 @@ callsRouter.post('/:channelName/record/start', async (req, res) => {
         recorderToken // 🔑 pass token
       );
 
-      // success
       return res.json({ ok: true, resourceId, sid });
     } catch (err) {
-      // optional: write an error marker to the doc
       await ref.set({ rec: { startErrorAt: nowMs(), startError: String(err) } }, { merge: true });
       throw err;
     } finally {
@@ -557,33 +765,44 @@ callsRouter.post('/:channelName/record/start', async (req, res) => {
   }
 });
 
-// STOP recording (client calls on hangup; should be called once)
+// STOP recording (idempotent; lock-aware)
 callsRouter.post('/:channelName/record/stop', async (req, res) => {
   try {
     const { channelName } = req.params;
+    const ref = channelDocRef(channelName);
 
-    const snap = await channelDocRef(channelName).get();
-    const rec = snap.data()?.rec;
-
+    let rec: any = (await ref.get()).data()?.rec;
     if (!rec?.resourceId || !rec?.sid) {
       return res.status(400).json({ error: 'No active recording for this channel' });
     }
-
-    // If already stopped, make it idempotent
     if (rec?.stoppedAt) {
       return res.json({ ok: true, alreadyStopped: true });
     }
 
-    // MUST use the SAME numeric uid as /start (our dedicated recorder UID)
-    const recorderUid: string = String(rec.recorderUid || RECORDER_UID);
+    let stopLockId: string | null = null;
+    try {
+      stopLockId = await acquireStopLock(channelName, String((req as any).uid || 'system'));
+    } catch (e: any) {
+      if (e?.message === 'ALREADY_STOPPED') {
+        return res.json({ ok: true, alreadyStopped: true });
+      }
+      if (e?.message === 'ALREADY_STOPPING') {
+        return res.status(202).json({ ok: true, stopping: true });
+      }
+      throw e;
+    }
+
+    rec = (await ref.get()).data()?.rec;
+    const recorderUid: string = String(rec?.recorderUid || RECORDER_UID);
     if (!/^\d+$/.test(recorderUid)) {
+      await releaseStopLock(channelName, stopLockId);
       return res.status(500).json({ error: 'Invalid recorderUid stored for this call' });
     }
 
     await stopRecording(rec.resourceId, rec.sid, channelName, recorderUid);
+    await ref.set({ rec: { ...rec, stoppedAt: Date.now() } }, { merge: true });
 
-    await channelDocRef(channelName).set({ rec: { ...rec, stoppedAt: Date.now() } }, { merge: true });
-
+    await releaseStopLock(channelName, stopLockId);
     return res.json({ ok: true });
   } catch (e) {
     console.error('❌ record/stop error', e);
@@ -609,9 +828,15 @@ callsRouter.get('/:channelName/record/status', async (req, res) => {
 });
 
 // ========= GCS signed URL utilities =========
-const AUDIO_EXT_RE = /\.(m4a|aac|wav|mp3|mp4|m3u8|ts)$/i;
+// Only single-file audio/video types for AAI; avoid .m3u8/.ts
+const AUDIO_EXT_RE = /\.(m4a|aac|wav|mp3|mp4)$/i;
+const MP4_RE = /\.mp4$/i;
 
-async function listLatestFileUnderPrefix(bucketName: string, prefixesToTry: string[]): Promise<File | null> {
+async function listLatestFileUnderPrefix(
+  bucketName: string,
+  prefixesToTry: string[],
+  preferMp4 = true
+): Promise<File | null> {
   const bucket = storage.bucket(bucketName);
 
   for (const prefix of prefixesToTry) {
@@ -630,10 +855,34 @@ async function listLatestFileUnderPrefix(bucketName: string, prefixesToTry: stri
     );
 
     withMeta.sort((a, b) => b.updated.getTime() - a.updated.getTime() || b.size - a.size);
-    return withMeta[0].f;
+
+    if (preferMp4) {
+      const mp4 = withMeta.find((x) => MP4_RE.test(x.f.name));
+      if (mp4) return mp4.f;
+    }
+    return withMeta[0]?.f ?? null;
   }
 
   return null;
+}
+
+function delay(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Try ~50s to catch finalized MP4; then fall back to newest audio
+async function waitForLatestMp4(
+  bucketName: string,
+  prefixesToTry: string[],
+  attempts = 7,
+  delayMs = 7000
+): Promise<File | null> {
+  for (let i = 0; i < attempts; i++) {
+    const f = await listLatestFileUnderPrefix(bucketName, prefixesToTry, true);
+    if (f && MP4_RE.test(f.name)) return f;
+    if (i < attempts - 1) await delay(delayMs);
+  }
+  return listLatestFileUnderPrefix(bucketName, prefixesToTry, false);
 }
 
 async function signedReadUrl(file: File, ttlSeconds = GCS_SIGN_URL_TTL_SECONDS) {
@@ -690,7 +939,7 @@ callsRouter.get('/:channelName/recording-url', async (req, res) => {
       prefixes.push(recomputed.objectPathBase);
     }
 
-    const file = await listLatestFileUnderPrefix(rec.bucket, prefixes);
+    const file = await listLatestFileUnderPrefix(rec.bucket, prefixes, true);
     if (!file) return res.status(404).json({ error: 'No recording files found yet' });
 
     const url = await signedReadUrl(file);
@@ -701,7 +950,7 @@ callsRouter.get('/:channelName/recording-url', async (req, res) => {
   }
 });
 
-// ========= AssemblyAI submission =========
+// ========= AssemblyAI submission (idempotent) =========
 callsRouter.post('/:channelName/transcribe', async (req, res) => {
   try {
     if (!ASSEMBLYAI_API_KEY) {
@@ -709,10 +958,36 @@ callsRouter.post('/:channelName/transcribe', async (req, res) => {
     }
 
     const { channelName } = req.params;
-    const callDoc = await channelDocRef(channelName).get();
-    const rec = callDoc.data()?.rec;
+    console.log('🔊 channelName:', channelName);
+    const ref = channelDocRef(channelName);
+    const callDoc = await ref.get();
+    const data = callDoc.data() || {};
+    const rec = data.rec;
+
+    // Already submitted/processing/completed?
+    const tr = data.transcription || {};
+    const status = String(tr.status || '');
+    if (['submitted', 'processing', 'completed'].includes(status) && tr.id) {
+      return res.json({ ok: true, alreadySubmitted: true, id: tr.id });
+    }
+
+    // Acquire submit lock
+    let submitLockId: string | null = null;
+    try {
+      submitLockId = await acquireSubmitLock(channelName, String((req as any).uid || 'system'));
+    } catch (e: any) {
+      if (e?.message === 'ALREADY_SUBMITTED') {
+        const latest = (await ref.get()).data()?.transcription || {};
+        return res.json({ ok: true, alreadySubmitted: true, id: latest.id });
+      }
+      if (e?.message === 'ALREADY_SUBMITTING') {
+        return res.status(202).json({ ok: true, submitting: true });
+      }
+      throw e;
+    }
 
     if (!rec?.bucket) {
+      await releaseSubmitLock(channelName, submitLockId!);
       return res.status(400).json({ error: 'No recording info on call doc' });
     }
 
@@ -722,14 +997,18 @@ callsRouter.post('/:channelName/transcribe', async (req, res) => {
       prefixes.push(recomputed.objectPathBase);
     }
 
-    const file = await listLatestFileUnderPrefix(rec.bucket, prefixes);
+    // Wait briefly for MP4 to finalize; then fall back to any audio-like file
+    const file = await waitForLatestMp4(rec.bucket, prefixes);
     if (!file) {
+      await releaseSubmitLock(channelName, submitLockId!);
       return res.status(404).json({ error: 'Recording file not found (yet). Try again shortly.' });
     }
 
     const signedUrl = await signedReadUrl(file);
 
-    const webhookUrlBase = process.env.API_BASE_URL || '';
+    // use the public webhook base (from ngrok locally) to receive webhooks
+    console.log('🔊 PUBLIC_BASE_URL:', process.env.PUBLIC_BASE_URL);
+    const webhookUrlBase = process.env.PUBLIC_BASE_URL || process.env.API_BASE_URL || '';
     const webhookUrl = `${webhookUrlBase}/webhooks/assemblyai?channel=${encodeURIComponent(channelName)}`;
 
     const aaiResp = await fetch('https://api.assemblyai.com/v2/transcript', {
@@ -745,21 +1024,25 @@ callsRouter.post('/:channelName/transcribe', async (req, res) => {
         webhook_url: webhookUrl,
         webhook_auth_header_name: 'X-AI-Signature',
         webhook_auth_header_value: ASSEMBLYAI_WEBHOOK_SECRET,
+        // Optional: choose a speech model if you want
+        // speech_model: 'universal'
       }),
     });
 
     if (!aaiResp.ok) {
       const t = await aaiResp.text();
+      await releaseSubmitLock(channelName, submitLockId!);
       return res.status(502).json({ error: `AssemblyAI submit failed ${aaiResp.status}: ${t}` });
     }
 
-    const data = await aaiResp.json();
-    await channelDocRef(channelName).set(
-      { transcription: { id: data.id, status: 'submitted', submittedAt: Date.now() } },
+    const submitted = await aaiResp.json();
+    await ref.set(
+      { transcription: { id: submitted.id, status: 'submitted', submittedAt: Date.now() } },
       { merge: true }
     );
+    await releaseSubmitLock(channelName, submitLockId!);
 
-    return res.json({ ok: true, id: data.id });
+    return res.json({ ok: true, id: submitted.id });
   } catch (e) {
     console.error('❌ /transcribe error', e);
     return res.status(500).json({ error: 'Failed to submit transcription' });
@@ -810,7 +1093,7 @@ async function fetchAaiVtt(transcriptId: string): Promise<string> {
   return r.text();
 }
 
-// ========= Webhook =========
+// ========= Webhook (hardened) =========
 export const assemblyAiWebhookHandler: RequestHandler = async (req, res) => {
   try {
     const sig = String(req.header('X-AI-Signature') || '');
@@ -821,43 +1104,65 @@ export const assemblyAiWebhookHandler: RequestHandler = async (req, res) => {
     const channel = String(req.query.channel || '');
     if (!channel) return res.status(400).json({ error: 'Missing channel' });
 
-    const payload = req.body || {};
-    const status = String(payload.status || '');
+    const payload: any = req.body || {};
+    const status = String(payload.status ?? '');
+
+    // Normalize transcript ID
+    const transcriptIdRaw = payload.id ?? payload.transcript_id ?? payload.transcriptId ?? null;
+    const transcriptId = transcriptIdRaw != null ? String(transcriptIdRaw) : null;
+
+    // Read current doc to compare IDs (ignore foreign/duplicate jobs)
+    const callSnap = await channelDocRef(channel).get();
+    const callData = callSnap.data() || {};
+    const currentTr = callData.transcription || {};
+    const currentId: string | null = currentTr.id || null;
+
+    if (transcriptId && currentId && transcriptId !== currentId) {
+      await channelDocRef(channel).set(
+        { transcription: { duplicates: FieldValue.arrayUnion(transcriptId), updatedAt: Date.now() } },
+        { merge: true }
+      );
+      return res.json({ ok: true, ignored: true });
+    }
+
+    const baseUpdate: Record<string, any> = { status: status || 'unknown', updatedAt: Date.now() };
+    if (transcriptId) baseUpdate.id = transcriptId;
 
     if (status === 'completed') {
+      const rec = callData.rec || {};
+      const bucketForArchive = String(rec.bucket || GCS_BUCKET || '');
+
       await channelDocRef(channel).set(
-        {
-          transcription: {
-            id: payload.id,
-            status,
-            text: payload.text ?? null,
-            summary: payload.summary ?? null,
-            completedAt: Date.now(),
-          },
-        },
+        { transcription: { ...baseUpdate, text: payload.text ?? null, summary: payload.summary ?? null, completedAt: Date.now() } },
         { merge: true }
       );
 
-      if (ARCHIVE_TRANSCRIPTS_TO_GCS && GCS_BUCKET) {
+      if (ARCHIVE_TRANSCRIPTS_TO_GCS && bucketForArchive && transcriptId) {
         try {
           const [fullJson, plainText, srtText, vttText] = await Promise.all([
-            fetchAaiJson(payload.id),
-            fetchAaiText(payload.id),
-            fetchAaiSrt(payload.id),
-            fetchAaiVtt(payload.id),
+            fetchAaiJson(transcriptId),
+            fetchAaiText(transcriptId),
+            fetchAaiSrt(transcriptId),
+            fetchAaiVtt(transcriptId),
           ]);
 
-          const base = `${TRANSCRIPTS_PREFIX}/${encodeURIComponent(channel)}/${payload.id}`;
+          // Prefer saving alongside the call recording
+          const recBase: string | undefined = typeof rec.objectPathBase === 'string' ? rec.objectPathBase : undefined;
+
+          const base = recBase
+            ? `${recBase.replace(/\/$/, '')}/transcripts/${transcriptId}`
+            : `${TRANSCRIPTS_PREFIX}/${encodeURIComponent(channel)}/${transcriptId}`;
+
           const jsonPath = `${base}/transcript.json`;
           const txtPath = `${base}/transcript.txt`;
           const srtPath = `${base}/transcript.srt`;
           const vttPath = `${base}/transcript.vtt`;
 
           await Promise.all([
-            saveStringToGcs(GCS_BUCKET, jsonPath, JSON.stringify(fullJson, null, 2), 'application/json'),
-            saveStringToGcs(GCS_BUCKET, txtPath, plainText, 'text/plain; charset=utf-8'),
-            saveStringToGcs(GCS_BUCKET, srtPath, srtText, 'application/x-subrip; charset=utf-8'),
-            saveStringToGcs(GCS_BUCKET, vttPath, vttText, 'text/vtt; charset=utf-8'),
+            saveStringToGcs(bucketForArchive, jsonPath, JSON.stringify(fullJson, null, 2), 'application/json'),
+            saveStringToGcs(bucketForArchive, txtPath, plainText, 'text/plain; charset=utf-8'),
+            saveStringToGcs(bucketForArchive, srtPath, srtText, 'application/x-subrip; charset=utf-8'),
+            saveStringToGcs(bucketForArchive, vttPath, vttText, 'text/vtt; charset=utf-8'),
           ]);
 
           await channelDocRef(channel).set(
@@ -865,12 +1170,12 @@ export const assemblyAiWebhookHandler: RequestHandler = async (req, res) => {
               transcription: {
                 archivedToGcs: true,
                 gcs: {
-                  bucket: GCS_BUCKET,
+                  bucket: bucketForArchive,
                   basePrefix: base,
-                  json: `gs://${GCS_BUCKET}/${jsonPath}`,
-                  txt: `gs://${GCS_BUCKET}/${txtPath}`,
-                  srt: `gs://${GCS_BUCKET}/${srtPath}`,
-                  vtt: `gs://${GCS_BUCKET}/${vttPath}`,
+                  json: `gs://${bucketForArchive}/${jsonPath}`,
+                  txt: `gs://${bucketForArchive}/${txtPath}`,
+                  srt: `gs://${bucketForArchive}/${srtPath}`,
+                  vtt: `gs://${bucketForArchive}/${vttPath}`,
                 },
               },
             },
@@ -886,16 +1191,14 @@ export const assemblyAiWebhookHandler: RequestHandler = async (req, res) => {
 
     if (status === 'error') {
       await channelDocRef(channel).set(
-        { transcription: { id: payload.id, status, error: payload.error, completedAt: Date.now() } },
+        { transcription: { ...baseUpdate, error: payload.error ?? 'unknown', completedAt: Date.now() } },
         { merge: true }
       );
       return res.json({ ok: true });
     }
 
-    await channelDocRef(channel).set(
-      { transcription: { id: payload.id, status, updatedAt: Date.now() } },
-      { merge: true }
-    );
+    // Other statuses ("queued", "processing", etc.)
+    await channelDocRef(channel).set({ transcription: baseUpdate }, { merge: true });
     return res.json({ ok: true });
   } catch (e) {
     console.error('❌ AssemblyAI webhook error', e);

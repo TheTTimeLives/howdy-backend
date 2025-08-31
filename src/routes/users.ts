@@ -332,6 +332,8 @@ usersRouter.post('/review', verifyJwt, async (req, res) => {
       await callSnap.docs[0].ref.update({ reviewed: true });
     }
 
+    // ✅ Removed transcript submission from review flow to avoid duplicates.
+
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error('❌ Review submission failed:', e);

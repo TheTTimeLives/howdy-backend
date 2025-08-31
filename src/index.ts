@@ -21,6 +21,9 @@ import Stripe from 'stripe';
 import crypto from 'crypto';
 import { onboardingRouter } from './routes/onboarding';
 import { callsRouter, assemblyAiWebhookHandler } from './routes/calls';
+// Using require for node-cron to avoid TS type issues without @types
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const cron = require('node-cron');
 
 const app = express();
 
@@ -155,3 +158,18 @@ app.listen(PORT, HOST, () => {
   console.log(`🚀 Backend is live at http://${HOST}:${PORT}`);
   console.log('🌐 If running on real device, use your machine\'s local IP.');
 });
+
+// === Cron Jobs ===
+try {
+  const enableBackfill = String(process.env.ENABLE_TRANSCRIPT_BACKFILL || 'true').toLowerCase() === 'true';
+  if (enableBackfill) {
+    // Run daily at 02:30 server time
+    cron.schedule('30 2 * * *', async () => {
+      const { runTranscriptBackfillJob } = await import('./jobs/transcriptBackfillJob');
+      await runTranscriptBackfillJob();
+    });
+    console.log('⏰ Transcript backfill cron scheduled for 02:30 daily');
+  }
+} catch (e) {
+  console.warn('⚠️ Failed to schedule transcript backfill cron:', e);
+}
