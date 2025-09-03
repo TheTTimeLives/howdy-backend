@@ -1,5 +1,6 @@
 import express from 'express';
 import { db } from '../firebase';
+import { decryptString } from '../utils/pii';
 import { verifyJwt } from '../verifyJwt';
 import axios from 'axios';
 import * as admin from 'firebase-admin';
@@ -22,6 +23,8 @@ usersRouter.get('/me', async (req, res) => {
     }
 
     const metadata = metadataDoc.data();
+    const userDoc = await db.collection('users').doc(uid).get();
+    const userData = userDoc.data() || {};
     const joinedPoolIds: string[] = metadata?.joinedPools || [];
     const blockedCategoryIds: string[] = metadata?.blockedCategories || [];
 
@@ -61,6 +64,18 @@ usersRouter.get('/me', async (req, res) => {
         ? 'hosted'
         : null;
 
+    let firstName: string | null = null;
+    let lastName: string | null = null;
+    if (userData?.pii) {
+      console.log('🔊 userData.pii:', userData.pii);
+      if (typeof userData.pii.firstNameEnc === 'string') {
+        firstName = decryptString(userData.pii.firstNameEnc);
+      }
+      if (typeof userData.pii.lastNameEnc === 'string') {
+        lastName = decryptString(userData.pii.lastNameEnc);
+      }
+    }
+
     return res.status(200).json({
       username: metadata?.username ?? '',
       photoUrl,
@@ -83,6 +98,9 @@ usersRouter.get('/me', async (req, res) => {
         required: !!metadata?.mfa?.required,
         methods: Array.isArray(metadata?.mfa?.methods) ? metadata?.mfa?.methods : [],
       } : { required: false, methods: [] },
+      // Expose decrypted names if present; otherwise null
+      firstName,
+      lastName,
     });
   } catch (e) {
     console.error('❌ Fetch error:', e);

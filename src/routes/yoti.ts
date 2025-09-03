@@ -1,6 +1,7 @@
 import express from 'express';
 import * as fs from 'fs';
 import { db } from '../firebase';
+import { encryptString } from '../utils/pii';
 import { verifyJwt } from '../verifyJwt';
 
 import {
@@ -271,6 +272,35 @@ yotiRouter.post('/webhook', async (req, res) => {
       }
 
       if (userId) {
+        // Store encrypted first/last name on users collection when available (best-effort parsing)
+        try {
+          const textChecks = sessionResult.getIdDocumentTextDataChecks();
+          if (textChecks.length > 0) {
+            const check = textChecks[0];
+            const fields = (check as any).getDocumentFields?.();
+            let fullName: string | undefined;
+            if (fields) fullName = fields.getField('full_name')?.getValue();
+            if (fullName && typeof fullName === 'string') {
+              const parts = fullName.trim().split(/\s+/);
+              const first = parts[0] || '';
+              const last = parts.length > 1 ? parts.slice(1).join(' ') : '';
+              const firstEnc = first ? encryptString(first) : null;
+              const lastEnc = last ? encryptString(last) : null;
+              if (firstEnc || lastEnc) {
+                await db.collection('users').doc(userId).set({
+                  pii: {
+                    ...(firstEnc ? { firstNameEnc: firstEnc } : {}),
+                    ...(lastEnc ? { lastNameEnc: lastEnc } : {}),
+                    piiVersion: 1,
+                  },
+                }, { merge: true });
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('⚠️ Failed to extract/store PII from Yoti result:', e);
+        }
+
         await db.collection('user_metadata').doc(userId).update(update);
         console.log(`✅ Updated verification status for user ${userId}:`, update);
       } else {

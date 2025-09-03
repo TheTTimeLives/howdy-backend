@@ -1,15 +1,173 @@
 import express from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import { db } from '../firebase';
 import crypto from 'crypto';
+import { FieldValue } from 'firebase-admin/firestore';
 import { sendEmail } from '../utils/email';
-// Use authenticator for Base‑32 secrets + keyuri; we can still import totp if you
-// want timeRemaining(), but verification must use authenticator to match Base‑32.
 import { authenticator, totp } from 'otplib';
 import { verifyJwt } from '../verifyJwt';
+import { db } from '../firebase';
 
 export const authRouter = express.Router();
+
+// /**
+//  * Resolve a group by a human-entered group code.
+//  * Supports two storage styles:
+//  *  1) groups.groupCode === CODE
+//  *  2) groups/*/codes/<doc> with { code: CODE, active?: boolean }
+
+
+async function resolveGroupByCode(input: string): Promise<{
+  groupId: string;
+  groupName: string;
+  code: string;
+} | null> {
+  const code = String(input || '').trim().toUpperCase();
+  if (!code) return null;
+
+  // Try groups.groupCode == code
+  const byRoot = await db.collection('groups').where('groupCode', '==', code).limit(1).get();
+  if (!byRoot.empty) {
+    const g = byRoot.docs[0];
+    const d = g.data() || {};
+    return { groupId: g.id, groupName: String(d.name || ''), code };
+  }
+
+  // Try collectionGroup('codes') where code == code
+  const cg = await db.collectionGroup('codes').where('code', '==', code).limit(1).get();
+  if (!cg.empty) {
+    const c = cg.docs[0];
+    const active = (c.data() as any)?.active !== false; // default to active if missing
+    if (!active) return null;
+    const groupRef = c.ref.parent.parent;
+    if (!groupRef) return null;
+    const g = await groupRef.get();
+    const d = g.data() || {};
+    return { groupId: g.id, groupName: String(d.name || ''), code };
+  }
+
+  return null;
+}
+
+// --- Group code validation (public) ---
+authRouter.post('/validate-group-code', async (req, res) => {
+  try {
+    const code = String(req.body?.code || '');
+    const found = await resolveGroupByCode(code);
+    if (!found) return res.status(404).json({ error: 'Invalid group code' });
+    return res.status(200).json({ ok: true, groupId: found.groupId, groupName: found.groupName });
+  } catch (e) {
+    console.error('❌ validate-group-code error', e);
+    return res.status(500).json({ error: 'Failed to validate group code' });
+  }
+});
+
+// POST /auth/signup-invite { token, password }
+authRouter.post('/signup-invite', async (req, res) => {
+  const token = String(req.body?.token || '');
+  const password = String(req.body?.password || '');
+  if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const inviteDoc = await db.collection('group_invites').doc(token).get();
+    if (!inviteDoc.exists) return res.status(400).json({ error: 'Invalid token' });
+    const inv = inviteDoc.data() as any;
+    if (Date.now() > (inv.expiresAt || 0)) return res.status(400).json({ error: 'Invite expired' });
+
+    const email = String(inv.email || '').toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Invite missing email' });
+
+    const pwErr = validatePasswordComplexity(password);
+    if (pwErr) return res.status(400).json({ error: pwErr });
+
+    // create user if not exists
+    const existing = await db.collection('users').where('email', '==', email).get();
+    if (!existing.empty) return res.status(400).json({ error: 'Account already exists for this email' });
+
+    const hash = await bcrypt.hash(password, 10);
+    const userRef = db.collection('users').doc();
+    const uid = userRef.id;
+    await userRef.set({ email, passwordHash: hash });
+
+    // attach metadata and group code
+    const groupSnap = await db.collection('groups').doc(inv.groupId).get();
+    const group = groupSnap.data() || {};
+    const groupCode = group.groupCode || null;
+    const accountType = inv.role === 'member' ? 'member' : 'carer';
+    await db.collection('user_metadata').doc(uid).set({
+      accountType,
+      primaryGroupId: inv.groupId,
+      ...(groupCode ? { groupCodes: [groupCode] } : {}),
+    }, { merge: true });
+
+    // accept invite: add to group members
+    await db.collection('groups').doc(inv.groupId).collection('members').doc(email).set({
+      uid,
+      email,
+      role: inv.role || 'member',
+      status: 'active',
+      acceptedAt: Date.now(),
+    }, { merge: true });
+    await inviteDoc.ref.delete();
+
+    return res.status(200).json({ ok: true, uid });
+  } catch (e) {
+    console.error('❌ signup-invite failed', e);
+    return res.status(500).json({ error: 'Failed to sign up' });
+  }
+});
+
+// POST /auth/accept-member-invite { token }
+authRouter.post('/accept-member-invite', async (req, res) => {
+  const token = String(req.body?.token || '');
+  if (!token) return res.status(400).json({ error: 'Missing token' });
+  try {
+    const inviteDoc = await db.collection('group_invites').doc(token).get();
+    if (!inviteDoc.exists) return res.status(400).json({ error: 'Invalid token' });
+    const inv = inviteDoc.data() as any;
+    if (Date.now() > (inv.expiresAt || 0)) return res.status(400).json({ error: 'Invite expired' });
+    const email = String(inv.email || '').toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Invite missing email' });
+
+    // create user if not exists; mark isMember
+    let uid: string | null = null;
+    const existing = await db.collection('users').where('email', '==', email).get();
+    if (!existing.empty) {
+      uid = existing.docs[0].id;
+    } else {
+      const userRef = db.collection('users').doc();
+      uid = userRef.id;
+      await userRef.set({ email, isMember: true });
+    }
+
+    await db.collection('users').doc(uid!).set({ isMember: true }, { merge: true });
+    const groupSnap = await db.collection('groups').doc(inv.groupId).get();
+    const group = groupSnap.data() || {};
+    const groupCode = group.groupCode || null;
+    await db.collection('user_metadata').doc(uid!).set({
+      accountType: 'member',
+      primaryGroupId: inv.groupId,
+      ...(groupCode ? { groupCodes: [groupCode] } : {}),
+    }, { merge: true });
+
+    await db.collection('groups').doc(inv.groupId).collection('members').doc(email).set({
+      uid,
+      email,
+      role: 'member',
+      status: 'active',
+      acceptedAt: Date.now(),
+    }, { merge: true });
+    await inviteDoc.ref.delete();
+
+    const accessToken = jwt.sign({ uid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
+    const refreshToken = jwt.sign({ uid, t: 'refresh' }, process.env.JWT_SECRET!, { expiresIn: '180d' });
+    await db.collection('refresh_tokens').doc().set({ uid, token: refreshToken, createdAt: Date.now() });
+
+    return res.status(200).json({ ok: true, uid, accessToken, refreshToken });
+  } catch (e) {
+    console.error('❌ accept-member-invite failed', e);
+    return res.status(500).json({ error: 'Failed to accept invite' });
+  }
+});
 
 // --------- Config knobs ---------
 const TOTP_WINDOW_STEPS = Number(process.env.TOTP_WINDOW_STEPS || '1'); // bump to 2–3 temporarily if diagnosing drift
@@ -57,8 +215,10 @@ function validatePasswordComplexity(password: unknown): string | null {
 authRouter.post('/signup', async (req, res) => {
   const rawEmail = req.body?.email;
   const password = req.body?.password;
-  const groupCodes = req.body?.groupCodes;
+  const groupCodes = req.body?.groupCodes; // legacy array
+  const groupCodeSingle = req.body?.groupCode; // new single string
   const accountType = req.body?.accountType;
+  const groupNameInput = typeof req.body?.groupName === 'string' ? String(req.body.groupName).trim() : '';
 
   const email = toEmail(rawEmail);
   if (!email || !password) {
@@ -85,40 +245,70 @@ authRouter.post('/signup', async (req, res) => {
       passwordHash: hash,
     });
 
-    const initialGroupCodes: string[] = Array.isArray(groupCodes)
-      ? groupCodes.filter((c: any) => typeof c === 'string' && c.trim().length > 0)
-      : (typeof groupCodes === 'string' && groupCodes.trim().length > 0
-        ? [groupCodes.trim()]
-        : []);
-
+    // Normalize account type
     const normalizedType =
       typeof accountType === 'string'
         ? String(accountType).toLowerCase()
         : 'individual';
 
-    const isGroupAdminSignup = normalizedType === 'carer' || normalizedType === 'organization';
+    // Normalize incoming group code
+    const incomingCode: string | null =
+      typeof groupCodeSingle === 'string' && groupCodeSingle.trim().length > 0
+        ? groupCodeSingle.trim().toUpperCase()
+        : (Array.isArray(groupCodes) && groupCodes.length > 0 && typeof groupCodes[0] === 'string'
+            ? String(groupCodes[0]).trim().toUpperCase()
+            : null);
 
+    // Base metadata
     await db.collection('user_metadata').doc(userId).set({
       verificationStatus: 'awaiting',
       onboarded: false,
-      groupCodes: initialGroupCodes,
       accountType: normalizedType,
-    });
+      ...(incomingCode ? { groupCodes: [incomingCode] } : {}),
+    }, { merge: true });
 
-    if (isGroupAdminSignup) {
+    if (normalizedType === 'organization') {
+      // NEW: Must join an existing org via required groupCode
+      if (!incomingCode) {
+        return res.status(400).json({ error: 'Group Code is required for organization accounts' });
+      }
+      const found = await resolveGroupByCode(incomingCode);
+      if (!found) {
+        return res.status(400).json({ error: 'Invalid or inactive Group Code' });
+      }
+
+      const groupId = found.groupId;
+
+      // Attach user to the existing org (role can be tuned; using 'admin' by default)
+      await db.collection('groups').doc(groupId).collection('members').doc(userId).set({
+        uid: userId,
+        email,
+        role: 'admin',
+        addedAt: Date.now(),
+        status: 'active',
+      }, { merge: true });
+
+      await db.collection('user_metadata').doc(userId).set({
+        primaryGroupId: groupId,
+      }, { merge: true });
+    } else if (normalizedType === 'carer') {
+      // Carer creates a fresh group with explicit group name from signup
+      if (!groupNameInput) {
+        return res.status(400).json({ error: 'Group name is required for carer accounts' });
+      }
       const groupRef = db.collection('groups').doc();
       const groupId = groupRef.id;
-      const inferredName = normalizedType === 'organization'
-        ? email.split('@')[1]?.split('.')?.[0] || 'Organization'
-        : email.split('@')[0] || 'Carer';
+      const providedName = groupNameInput;
 
+      const groupCode = crypto.randomBytes(3).toString('hex').toUpperCase();
       await groupRef.set({
-        name: inferredName,
-        type: normalizedType, // 'carer' | 'organization'
+        name: providedName,
+        type: normalizedType, // 'carer'
         createdBy: userId,
         createdAt: Date.now(),
         tier: 'trial',
         trialEndsAt: Date.now() + 7 * 24 * 60 * 60 * 1000, // 1 week trial
+        groupCode,
       });
 
       await groupRef.collection('members').doc(userId).set({
@@ -131,7 +321,10 @@ authRouter.post('/signup', async (req, res) => {
 
       await db.collection('user_metadata').doc(userId).set({
         primaryGroupId: groupId,
+        groupCodes: [groupCode],
       }, { merge: true });
+    } else {
+      // 'individual' – nothing extra to do
     }
 
     const accessToken = jwt.sign({ uid: userId }, process.env.JWT_SECRET!, { expiresIn: '15m' });

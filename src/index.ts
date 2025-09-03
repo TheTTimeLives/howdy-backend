@@ -1,9 +1,14 @@
+// src/index.ts
 import dotenv from 'dotenv';
 dotenv.config();
 
 import express from 'express';
 import cors from 'cors';
 import { json } from 'body-parser';
+import path from 'path';
+import crypto from 'crypto';
+import Stripe from 'stripe';
+
 import { authRouter } from './routes/auth';
 import { enqueueRouter } from './routes/enqueue';
 import { usersRouter } from './routes/users';
@@ -15,24 +20,19 @@ import { scheduledCallRouter } from './routes/scheduledCallRouter';
 import { groupsRouter } from './routes/groups';
 import { pushRouter } from './routes/pushRouter';
 import { subscriptionsRouter } from './routes/subscriptions';
-import path from 'path';
 import { billingRouter } from './routes/billing';
-import Stripe from 'stripe';
-import crypto from 'crypto';
 import { onboardingRouter } from './routes/onboarding';
 import { callsRouter, assemblyAiWebhookHandler } from './routes/calls';
-// Using require for node-cron to avoid TS type issues without @types
+import { devicesRouter, devicesPublicRouter } from './routes/devices';
+
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const cron = require('node-cron');
 
 const app = express();
 
-// --- Raw-body webhook endpoints (must be before json()) ---
-
-// AssemblyAI webhook (JSON body; not JWT-protected)
+/* ===== Raw-body webhook endpoints (must be before json()) ===== */
 app.post('/webhooks/assemblyai', express.json({ limit: '20mb' }), assemblyAiWebhookHandler);
 
-// Stripe webhook
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion: '2022-11-15' });
@@ -77,17 +77,11 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
   }
 });
 
-// RevenueCat webhook (HMAC SHA256 over raw body using REVENUECAT_WEBHOOK_SECRET)
 app.post('/webhooks/revenuecat', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
     const signature = String(req.header('X-RevenueCat-Signature') || '');
-    // const secret = process.env.REVENUECAT_WEBHOOK_SECRET || '';
-    // if (!verifyRevenueCatSignature(req.body, signature, secret)) {
-    //   return res.status(400).send('Invalid signature');
-    // }
     const payload = JSON.parse(req.body.toString('utf8'));
     const appUserId: string | undefined = payload?.app_user_id;
-    // Derive entitlement active/tier (payload schema may vary by event)
     const entitlementActive = !!payload?.entitlements && Object.values(payload.entitlements).some((e: any) => !!(e as any)?.active);
     const productId: string | undefined = payload?.product_identifier;
     const tier = productId ? mapRevenueCatProductToTier(productId) : undefined;
@@ -132,10 +126,15 @@ function verifyRevenueCatSignature(rawBody: Buffer, signature: string, secret: s
     return false;
   }
 }
-app.use(express.static(path.join(__dirname, '../public')));
+
+/* ===== Global middleware BEFORE routers that expect JSON bodies ===== */
 app.use(cors());
 app.use(json());
+app.use(express.static(path.join(__dirname, '../public')));
 
+/* ===== Routers ===== */
+app.use('/devices', devicesPublicRouter);
+app.use('/groups', groupsRouter);
 app.use('/enqueue', enqueueRouter);
 app.use('/calls', callsRouter);
 app.use('/users', usersRouter);
@@ -146,10 +145,10 @@ app.use('/matchQueue', matchQueueRouter);
 app.use('/match', matchActionsRouter);
 app.use('/scheduled', scheduledCallRouter);
 app.use('/push', pushRouter);
-app.use('/groups', groupsRouter);
 app.use('/subscriptions', subscriptionsRouter);
 app.use('/billing', billingRouter);
 app.use('/onboarding', onboardingRouter);
+app.use('/devices', devicesRouter);
 
 const PORT = Number(process.env.PORT) || 5000;
 const HOST = '0.0.0.0';
@@ -159,11 +158,11 @@ app.listen(PORT, HOST, () => {
   console.log('🌐 If running on real device, use your machine\'s local IP.');
 });
 
-// === Cron Jobs ===
+/* ===== Cron Jobs ===== */
 try {
   const enableBackfill = String(process.env.ENABLE_TRANSCRIPT_BACKFILL || 'true').toLowerCase() === 'true';
   if (enableBackfill) {
-    // Run daily at 02:30 server time
+    const cron = require('node-cron');
     cron.schedule('30 2 * * *', async () => {
       const { runTranscriptBackfillJob } = await import('./jobs/transcriptBackfillJob');
       await runTranscriptBackfillJob();
