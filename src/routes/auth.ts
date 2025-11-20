@@ -91,22 +91,26 @@ authRouter.post('/signup-invite', async (req, res) => {
     // attach metadata and group code
     const groupSnap = await db.collection('groups').doc(inv.groupId).get();
     const group = groupSnap.data() || {};
-    const groupCode = group.groupCode || null;
     const accountType = inv.role === 'member' ? 'member' : 'carer';
     await db.collection('user_metadata').doc(uid).set({
       accountType,
       primaryGroupId: inv.groupId,
-      ...(groupCode ? { groupCodes: [groupCode] } : {}),
     }, { merge: true });
 
-    // accept invite: add to group members
-    await db.collection('groups').doc(inv.groupId).collection('members').doc(email).set({
+    // accept invite: add to group members (store membership keyed by uid for consistency)
+    const membersCol = db.collection('groups').doc(inv.groupId).collection('members');
+    await membersCol.doc(uid).set({
       uid,
       email,
       role: inv.role || 'member',
       status: 'active',
       acceptedAt: Date.now(),
     }, { merge: true });
+    // clean up any placeholder invite/member record keyed by email (best-effort)
+    try {
+      await membersCol.doc(email).delete();
+    } catch (_) {}
+
     await inviteDoc.ref.delete();
 
     return res.status(200).json({ ok: true, uid });
@@ -123,46 +127,69 @@ authRouter.post('/accept-member-invite', async (req, res) => {
   try {
     const inviteDoc = await db.collection('group_invites').doc(token).get();
     if (!inviteDoc.exists) return res.status(400).json({ error: 'Invalid token' });
-    const inv = inviteDoc.data() as any;
-    if (Date.now() > (inv.expiresAt || 0)) return res.status(400).json({ error: 'Invite expired' });
-    const email = String(inv.email || '').toLowerCase();
-    if (!email) return res.status(400).json({ error: 'Invite missing email' });
+    const invite = inviteDoc.data() as any;
+    if (Date.now() > (invite.expiresAt || 0)) return res.status(400).json({ error: 'Invite expired' });
 
-    // create user if not exists; mark isMember
-    let uid: string | null = null;
-    const existing = await db.collection('users').where('email', '==', email).get();
-    if (!existing.empty) {
-      uid = existing.docs[0].id;
-    } else {
-      const userRef = db.collection('users').doc();
-      uid = userRef.id;
-      await userRef.set({ email, isMember: true });
+    // Only support member role for device/email-less fast accepts
+    const role: string = (invite.role || 'member').toString();
+    if (role !== 'member') {
+      return res.status(400).json({ error: 'Invite is not for a member account' });
     }
 
-    await db.collection('users').doc(uid!).set({ isMember: true }, { merge: true });
-    const groupSnap = await db.collection('groups').doc(inv.groupId).get();
+    // Resolve or create the user.
+    let uid: string;
+    let userEmail: string | null = null;
+    if (invite.email) {
+      userEmail = String(invite.email).toLowerCase();
+      const existing = await db.collection('users').where('email', '==', userEmail).limit(1).get();
+      if (!existing.empty) {
+        uid = existing.docs[0].id;
+      } else {
+        const newRef = db.collection('users').doc();
+        uid = newRef.id;
+        await newRef.set({ email: userEmail, isMember: true, createdAt: Date.now() });
+      }
+    } else {
+      const newRef = db.collection('users').doc();
+      uid = newRef.id;
+      await newRef.set({ isMember: true, createdAt: Date.now() });
+    }
+
+    // Ensure user metadata and primary group
+    const groupSnap = await db.collection('groups').doc(String(invite.groupId)).get();
     const group = groupSnap.data() || {};
-    const groupCode = group.groupCode || null;
-    await db.collection('user_metadata').doc(uid!).set({
+    await db.collection('user_metadata').doc(uid).set({
       accountType: 'member',
-      primaryGroupId: inv.groupId,
-      ...(groupCode ? { groupCodes: [groupCode] } : {}),
+      primaryGroupId: String(invite.groupId),
     }, { merge: true });
 
-    await db.collection('groups').doc(inv.groupId).collection('members').doc(email).set({
+    // Add/activate membership keyed by uid
+    const membersCol = db.collection('groups').doc(String(invite.groupId)).collection('members');
+    await membersCol.doc(uid).set({
       uid,
-      email,
+      email: userEmail || null,
       role: 'member',
       status: 'active',
       acceptedAt: Date.now(),
     }, { merge: true });
+    // If the invite carried an email, remove any placeholder member doc keyed by that email
+    if (userEmail) {
+      const placeholderRef = membersCol.doc(userEmail);
+      const snap = await placeholderRef.get();
+      if (snap.exists) {
+        await placeholderRef.delete().catch(() => { /* noop */ });
+      }
+    }
+
+    await invite.supportsDevice ? Promise.resolve() : Promise.resolve(); // placeholder if needed later
     await inviteDoc.ref.delete();
 
+    // Issue API tokens for this new/existing member
     const accessToken = jwt.sign({ uid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
     const refreshToken = jwt.sign({ uid, t: 'refresh' }, process.env.JWT_SECRET!, { expiresIn: '180d' });
     await db.collection('refresh_tokens').doc().set({ uid, token: refreshToken, createdAt: Date.now() });
 
-    return res.status(200).json({ ok: true, uid, accessToken, refreshToken });
+    return res.status(200).json({ ok: true, uid, groupId: String(invite.groupId), accessToken, refreshToken });
   } catch (e) {
     console.error('❌ accept-member-invite failed', e);
     return res.status(500).json({ error: 'Failed to accept invite' });
@@ -264,7 +291,6 @@ authRouter.post('/signup', async (req, res) => {
       verificationStatus: 'awaiting',
       onboarded: false,
       accountType: normalizedType,
-      ...(incomingCode ? { groupCodes: [incomingCode] } : {}),
     }, { merge: true });
 
     if (normalizedType === 'organization') {
@@ -321,7 +347,6 @@ authRouter.post('/signup', async (req, res) => {
 
       await db.collection('user_metadata').doc(userId).set({
         primaryGroupId: groupId,
-        groupCodes: [groupCode],
       }, { merge: true });
     } else {
       // 'individual' – nothing extra to do

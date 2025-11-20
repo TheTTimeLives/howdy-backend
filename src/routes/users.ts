@@ -1,5 +1,6 @@
 import express from 'express';
 import { db } from '../firebase';
+import { sendVoipNotification } from '../utils/sendVoipNotification';
 import { decryptString } from '../utils/pii';
 import { verifyJwt } from '../verifyJwt';
 import axios from 'axios';
@@ -23,6 +24,19 @@ usersRouter.get('/me', async (req, res) => {
     }
 
     const metadata = metadataDoc.data();
+    // Debug log to trace routing inputs
+    try {
+      console.log(
+        '[USERS /me] uid=%s verified=%s acct=%s stage=%s group=%s',
+        uid,
+        metadata?.verificationStatus ?? 'awaiting',
+        metadata?.accountType ?? 'individual',
+        metadata?.onboardingStage ?? 'bio',
+        metadata?.primaryGroupId ?? null
+      );
+    } catch (_e) {
+      // ignore log errors
+    }
     const userDoc = await db.collection('users').doc(uid).get();
     const userData = userDoc.data() || {};
     const joinedPoolIds: string[] = metadata?.joinedPools || [];
@@ -91,9 +105,12 @@ usersRouter.get('/me', async (req, res) => {
       groupCodes: metadata?.groupCodes ?? [],
       accountType: metadata?.accountType ?? 'individual',
       primaryGroupId: metadata?.primaryGroupId ?? null,
+      unmanagedSince: metadata?.unmanagedSince ?? null,
+      unmanagedDeleteAt: metadata?.unmanagedSince ? Number(metadata?.unmanagedSince) + (7 * 24 * 60 * 60 * 1000) : null,
       themeMode: metadata?.themeMode ?? null,
       textScale: metadata?.textScale ?? null,
       currentPrompt: metadata?.currentPrompt ?? null,
+      ui: metadata?.ui ?? null,
       mfa: metadata?.mfa ? {
         required: !!metadata?.mfa?.required,
         methods: Array.isArray(metadata?.mfa?.methods) ? metadata?.mfa?.methods : [],
@@ -124,7 +141,7 @@ usersRouter.post('/verification/reset', async (req, res) => {
 
 usersRouter.post('/preferences', async (req, res) => {
   const uid = (req as any).uid;
-  const { joinedPools, blockedCategories, groupCodes } = req.body;
+  const { joinedPools, blockedCategories } = req.body;
 
   if (!Array.isArray(joinedPools) || !Array.isArray(blockedCategories)) {
     return res.status(400).json({ error: 'Invalid format' });
@@ -132,9 +149,6 @@ usersRouter.post('/preferences', async (req, res) => {
 
   try {
     const update: any = { joinedPools, blockedCategories };
-    if (Array.isArray(groupCodes)) {
-      update.groupCodes = groupCodes.filter((c: any) => typeof c === 'string');
-    }
     await db.collection('user_metadata').doc(uid).update(update);
 
     res.status(200).json({ ok: true });
@@ -185,7 +199,7 @@ usersRouter.get('/tenor/search', async (req, res) => {
 
 usersRouter.post('/metadata', async (req, res) => {
   const uid = (req as any).uid;
-  const { username, photoUrl, bioResponses, onboardingStage, themeMode, textScale, groupCodes, currentPrompt, connectOutsidePreferences } = req.body;
+  const { username, photoUrl, bioResponses, onboardingStage, themeMode, textScale, currentPrompt, connectOutsidePreferences } = req.body;
 
 // Check individual fields before merging
 const updatePayload: any = {};
@@ -195,7 +209,6 @@ if (bioResponses) updatePayload.bioResponses = bioResponses;
 if (onboardingStage) updatePayload.onboardingStage = onboardingStage;
  if (themeMode) updatePayload.themeMode = themeMode;
  if (typeof textScale === 'number') updatePayload.textScale = textScale;
- if (Array.isArray(groupCodes)) updatePayload.groupCodes = groupCodes.filter((c: any) => typeof c === 'string');
  if (typeof currentPrompt === 'string') updatePayload.currentPrompt = currentPrompt;
  if (typeof connectOutsidePreferences === 'boolean') updatePayload.connectOutsidePreferences = connectOutsidePreferences;
 
@@ -454,5 +467,121 @@ usersRouter.post('/chi/accrue', verifyJwt, async (req, res) => {
   } catch (e) {
     console.error('❌ /users/chi/accrue failed:', e);
     return res.status(500).json({ error: 'Failed to accrue chi' });
+  }
+});
+
+// ===== Member UI settings (managed by carer/org) =====
+usersRouter.get('/members/:memberId/settings', async (req, res) => {
+  const requesterUid = (req as any).uid;
+  const memberId = String(req.params.memberId || '');
+  if (!memberId) return res.status(400).json({ error: 'Missing memberId' });
+  try {
+    const metaSnap = await db.collection('user_metadata').doc(memberId).get();
+    if (!metaSnap.exists) return res.status(404).json({ error: 'Member not found' });
+    const data = metaSnap.data() || {};
+    if ((data.accountType || '') !== 'member') {
+      return res.status(400).json({ error: 'Target user is not a member' });
+    }
+    const primaryGroupId = data.primaryGroupId;
+    const guardianUid = data.guardianUid;
+    if (!primaryGroupId && !guardianUid) {
+      return res.status(403).json({ error: 'Member is unmanaged' });
+    }
+    // authorize: guardian or group admin
+    let authorized = false;
+    if (guardianUid && guardianUid === requesterUid) authorized = true;
+    if (!authorized && primaryGroupId) {
+      const mem = await db.collection('groups').doc(primaryGroupId).collection('members').doc(requesterUid).get();
+      const role = mem.data()?.role || 'member';
+      if (['admin', 'super-admin'].includes(String(role))) authorized = true;
+    }
+    if (!authorized) return res.status(403).json({ error: 'Forbidden' });
+    return res.status(200).json({ ui: data.ui || null });
+  } catch (e) {
+    console.error('❌ GET member settings failed', e);
+    return res.status(500).json({ error: 'Failed to load settings' });
+  }
+});
+
+usersRouter.put('/members/:memberId/settings', async (req, res) => {
+  const requesterUid = (req as any).uid;
+  const memberId = String(req.params.memberId || '');
+  const level = req.body?.level ? String(req.body.level) : undefined;
+  const flags = (req.body?.flags && typeof req.body.flags === 'object') ? req.body.flags as Record<string, any> : undefined;
+  if (!memberId) return res.status(400).json({ error: 'Missing memberId' });
+  try {
+    const ref = db.collection('user_metadata').doc(memberId);
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: 'Member not found' });
+    const data = snap.data() || {};
+    if ((data.accountType || '') !== 'member') {
+      return res.status(400).json({ error: 'Target user is not a member' });
+    }
+    const primaryGroupId = data.primaryGroupId;
+    const guardianUid = data.guardianUid;
+
+    // authorize: guardian or group admin
+    let authorized = false;
+    if (guardianUid && guardianUid === requesterUid) authorized = true;
+    if (!authorized && primaryGroupId) {
+      const mem = await db.collection('groups').doc(primaryGroupId).collection('members').doc(requesterUid).get();
+      const role = mem.data()?.role || 'member';
+      if (['admin', 'super-admin'].includes(String(role))) authorized = true;
+    }
+    if (!authorized) return res.status(403).json({ error: 'Forbidden' });
+
+    console.log('📝 Updating member UI settings', {
+      requesterUid,
+      memberId,
+      inputLevel: level,
+      inputFlags: flags,
+    });
+
+    let effectiveFlags = flags && typeof flags === 'object' ? { ...flags } : undefined;
+    if (level && (!effectiveFlags || Object.keys(effectiveFlags).length === 0)) {
+      // Apply defaults by level if flags not provided
+      switch (level.toLowerCase()) {
+        case 'assisted':
+          effectiveFlags = { allowOutgoingCalls: false, showChat: false, showSchedule: false, showHistory: true };
+          break;
+        case 'standard':
+        case 'full':
+          effectiveFlags = { allowOutgoingCalls: true, showChat: true, showSchedule: true, showHistory: true };
+          break;
+        default:
+          break;
+      }
+    }
+
+    const uiPayload = {
+      ui: {
+        ...(level ? { level } : {}),
+        ...(effectiveFlags ? { flags: effectiveFlags } : {}),
+        updatedAt: Date.now(),
+        updatedBy: requesterUid,
+      }
+    };
+
+    console.log('💾 Persisting member UI payload', { memberId, uiPayload });
+
+    await ref.set(uiPayload, { merge: true });
+
+    // Notify the member device(s) to refresh settings
+    try {
+      console.log('📣 Sending member_ui_updated push to', memberId);
+      await sendVoipNotification(memberId, {
+        title: 'Settings updated',
+        body: 'Your caregiver updated your app settings',
+        data: { type: 'member_ui_updated' },
+      });
+    } catch (e) {
+      console.warn('⚠️ Failed to send settings update push:', e);
+    }
+
+    console.log('✅ Member UI settings updated', { memberId, level, effectiveFlags });
+    return res.status(200).json({ ok: true, level, flags: effectiveFlags });
+  } catch (e) {
+    console.error('❌ PUT member settings failed', e);
+    return res.status(500).json({ error: 'Failed to save settings' });
   }
 });

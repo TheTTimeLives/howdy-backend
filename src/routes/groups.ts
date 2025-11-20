@@ -1,6 +1,7 @@
 // src/routes/groups.ts
 import express from 'express';
 import crypto from 'crypto';
+import { FieldValue } from 'firebase-admin/firestore';
 import { db } from '../firebase';
 import { verifyJwt } from '../verifyJwt';
 import { sendEmail } from '../utils/email';
@@ -10,6 +11,24 @@ export const groupsRouter = express.Router();
 
 /* Parse JSON here too (guard against mount-order mistakes) */
 groupsRouter.use(express.json());
+
+/**
+ * Resolve the public base URL for invite/landing links during dev.
+ * Priority:
+ * 1) INVITE_LANDING_BASE_URL (computed by dev.sh to point at Functions/main tunnel)
+ * 2) PUBLIC_BASE_URL (main ngrok tunnel for backend)
+ * 3) API_BASE_URL / BACKEND_BASE_URL
+ * 4) localhost fallback
+ */
+function resolvePublicBase(): string {
+  return (
+    process.env.INVITE_LANDING_BASE_URL ||
+    process.env.PUBLIC_BASE_URL ||
+    process.env.API_BASE_URL ||
+    process.env.BACKEND_BASE_URL ||
+    'http://localhost:5000'
+  );
+}
 
 /* -------------------- PUBLIC: invite info (JSON) -------------------- */
 // GET /groups/invite-info/:token
@@ -135,10 +154,23 @@ groupsRouter.get('/me', async (req, res) => {
     const snap = await db.collection('groups').get();
     const groups: any[] = [];
     for (const doc of snap.docs) {
-      const member = await doc.ref.collection('members').doc(uid).get();
-      if (member.exists) {
+      // Prefer membership documents keyed by UID; if not present, fall back to a document
+      // where the stored field `uid` matches the current user.
+      let memberSnap = await doc.ref.collection('members').doc(uid).get();
+      if (!memberSnap.exists) {
+        const alt = await doc.ref
+          .collection('members')
+          .where('uid', '==', uid)
+          .limit(1)
+          .get();
+        if (!alt.empty) {
+          memberSnap = alt.docs[0];
+        }
+      }
+      if (memberSnap.exists) {
         const data = doc.data();
-        groups.push({ id: doc.id, ...data, role: member.data()?.role || 'member' });
+        const m = (memberSnap.data() as any) || {};
+        groups.push({ id: doc.id, ...data, role: m.role || 'member' });
       }
     }
     return res.status(200).json({ groups });
@@ -247,25 +279,20 @@ groupsRouter.post('/:groupId/members', async (req, res) => {
         groupName = (gdoc.data()?.name as string) || groupName;
       } catch {}
 
-      const publicBase =
-        process.env.PUBLIC_BASE_URL ||
-        process.env.API_BASE_URL ||
-        process.env.BACKEND_BASE_URL ||
-        'http://localhost:5000';
-
       const appDeepLink = `howdy://accept-invite?token=${token}${role ? `&role=${encodeURIComponent(role)}` : ''}`;
-      const webFallback = `${publicBase}/groups/invite/${token}${role ? `?role=${encodeURIComponent(role)}` : ''}`;
 
       try {
+        const publicBase = resolvePublicBase();
+        const webLink = `${publicBase}/invite.html?token=${encodeURIComponent(token)}${role ? `&role=${encodeURIComponent(role)}` : ''}`;
         await sendEmail(
           email,
           `You're invited to ${groupName} on Howdy`,
-          `You're invited to ${groupName} on Howdy.\n\nJoin on the web: ${webFallback}\nApp link: ${appDeepLink}`,
+          `You're invited to ${groupName} on Howdy.\n\nOpen in the app: ${webLink}`,
           `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;font-size:14px;color:#222;line-height:1.5">
             <p>Hi,</p>
             <p>You have been invited to join <strong>${groupName}</strong> on Howdy.</p>
             <p>
-              <a href="${webFallback}" style="
+              <a href="${webLink}" style="
                 display:inline-block;
                 background:#d37f1c;
                 color:#fff;
@@ -274,7 +301,6 @@ groupsRouter.post('/:groupId/members', async (req, res) => {
                 text-decoration:none;
                 font-weight:600;">Accept in the app</a>
             </p>
-            <p>You can also <a href="${webFallback}">join on the web</a> if preferred.</p>
             <p>Thanks,<br/>The Howdy Team</p>
           </div>`
         );
@@ -282,6 +308,26 @@ groupsRouter.post('/:groupId/members', async (req, res) => {
         console.warn('⚠️ Failed to send invite email', e);
       }
     }
+
+    // If we created an email invite above, expose the deep link for UI copy/share
+    // Note: when no email invite was created (memberId path), we simply return ok
+    try {
+      if (req.body?.email && !req.body?.memberId) {
+        const role = String(req.body?.role || 'member');
+        const tokenDoc = await db
+          .collection('group_invites')
+          .where('email', '==', String(req.body.email))
+          .orderBy('createdAt', 'desc')
+          .limit(1)
+          .get();
+        const token = tokenDoc.empty ? null : tokenDoc.docs[0].id;
+        if (token) {
+          const publicBase = resolvePublicBase();
+          const inviteLink = `${publicBase}/invite.html?token=${encodeURIComponent(token)}${role ? `&role=${encodeURIComponent(role)}` : ''}`;
+          return res.status(200).json({ ok: true, inviteToken: token, inviteLink });
+        }
+      }
+    } catch (_) {}
 
     return res.status(200).json({ ok: true });
   } catch (e) {
@@ -342,10 +388,89 @@ groupsRouter.delete('/:groupId/members/:memberDocId', async (req, res) => {
     }
 
     await memberRef.delete();
+
+    // Best-effort device unpair if memberDocId is a real uid
+    try {
+      const userMetaRef = db.collection('user_metadata').doc(memberDocId);
+      const userMetaSnap = await userMetaRef.get();
+      if (userMetaSnap.exists) {
+        const data = (userMetaSnap.data() || {}) as any;
+        const isMember = String(data.accountType || '') === 'member';
+        const isPrimaryGroup = String(data.primaryGroupId || '') === String(groupId);
+        if (isMember && isPrimaryGroup) {
+          const deviceId = data?.allowedDevice?.deviceId as string | undefined;
+          await userMetaRef.set({
+            allowedDevice: null,
+            deviceChallenge: null,
+            primaryGroupId: null,
+            unmanagedSince: Date.now(),
+          }, { merge: true });
+          if (deviceId) {
+            await db.collection('device_index').doc(deviceId).set(
+              { status: 'unpaired', uid: null, loginChallenge: null },
+              { merge: true }
+            );
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('⚠️ device unpair on member removal failed (non-fatal):', e);
+    }
+
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error('❌ remove member failed', e);
     return res.status(500).json({ error: 'Failed to remove member' });
+  }
+});
+
+// POST /groups/:groupId/invite → create shareable invite link (no email), returns { inviteToken, inviteLink }
+groupsRouter.post('/:groupId/invite', async (req, res) => {
+  const uid = (req as any).uid as string;
+  const { groupId } = req.params;
+  const role = String(req.body?.role || '').trim() || 'member';
+
+  try {
+    // Require admin
+    const adminDoc = await db.collection('groups').doc(groupId).collection('members').doc(uid).get();
+    const adminRole = adminDoc.data()?.role;
+    if (!adminDoc.exists || !['super-admin', 'admin', 'team-lead'].includes(adminRole)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+
+    // Validate requested role for group type
+    const groupDoc = await db.collection('groups').doc(groupId).get();
+    if (!groupDoc.exists) return res.status(404).json({ error: 'Group not found' });
+    const groupType = (groupDoc.data()?.type || 'carer').toString();
+    const baseAssignable = ['super-admin', 'admin', 'team-lead', 'volunteer', 'member'];
+    const carerAssignable = ['admin', 'member'];
+    const allowedRoles = groupType === 'carer' ? carerAssignable : baseAssignable;
+    if (!allowedRoles.includes(role)) {
+      return res.status(400).json({ error: `Role not allowed for this group (${role})` });
+    }
+
+    // Create token
+    const token = crypto.randomBytes(24).toString('hex');
+    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    await db.collection('group_invites').doc(token).set({
+      groupId,
+      email: null,
+      role,
+      invitedBy: uid,
+      createdAt: Date.now(),
+      expiresAt,
+    });
+
+    const publicBase = resolvePublicBase();
+
+    // Use static landing that deep-links into app when available
+    const inviteLink = `${publicBase}/invite.html?token=${encodeURIComponent(token)}${role ? `&role=${encodeURIComponent(role)}` : ''}`;
+
+    console.log('[INVITE share] group=%s role=%s base=%s link=%s', groupId, role, publicBase, inviteLink);
+    return res.status(200).json({ ok: true, inviteToken: token, inviteLink });
+  } catch (e) {
+    console.error('❌ create shareable invite failed', e);
+    return res.status(500).json({ error: 'Failed to create invite' });
   }
 });
 
@@ -465,11 +590,7 @@ groupsRouter.post('/invite/resend', async (req, res) => {
 
     const token = inviteRef.id;
 
-    const publicBase =
-      process.env.PUBLIC_BASE_URL ||
-      process.env.API_BASE_URL ||
-      process.env.BACKEND_BASE_URL ||
-      'http://localhost:5000';
+    const publicBase = resolvePublicBase();
 
     const appDeepLink = `howdy://accept-invite?token=${token}${invite.role ? `&role=${encodeURIComponent(invite.role)}` : ''}`;
     const webFallback = `${publicBase}/groups/invite/${token}${invite.role ? `?role=${encodeURIComponent(invite.role)}` : ''}`;

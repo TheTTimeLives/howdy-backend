@@ -129,8 +129,75 @@ function verifyRevenueCatSignature(rawBody: Buffer, signature: string, secret: s
 
 /* ===== Global middleware BEFORE routers that expect JSON bodies ===== */
 app.use(cors());
+// Handle CORS preflight for all routes (important for Flutter web JSON POST)
+app.options('*', cors());
 app.use(json());
 app.use(express.static(path.join(__dirname, '../public')));
+
+/* ===== Short invite landing (public) ===== */
+app.get('/i/:token', (req, res) => {
+  const token = String(req.params.token || '');
+  const role = req.query.role ? String(req.query.role) : '';
+  if (!token) return res.status(400).send('Missing invite token');
+
+  const deep = `howdy://accept-invite?token=${encodeURIComponent(token)}${
+    role ? `&role=${encodeURIComponent(role)}` : ''
+  }`;
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Accept invite • Howdy</title>
+    <meta name="apple-itunes-app" content="app-id=, app-argument=${deep}">
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, sans-serif; background:#f7f7f8; padding:24px; }
+      .card { max-width:560px; margin: 40px auto; background:#fff; border:1px solid #e6e6eb; border-radius:12px; padding:20px; }
+      .btn { display:inline-block; padding:12px 16px; border-radius:10px; background:#d37f1c; color:#fff; font-weight:600; text-decoration:none; }
+      .muted { color:#666; font-size:14px; }
+      .row { display:flex; gap:12px; flex-wrap:wrap; }
+      .store { display:inline-block; padding:10px 14px; border:1px solid #e6e6eb; border-radius:10px; text-decoration:none; color:#222 }
+    </style>
+    <script>
+      (function(){
+        var deep = ${JSON.stringify(deep)};
+        var ua = navigator.userAgent || '';
+        var isIOS = /iPhone|iPad|iPod/.test(ua);
+        var isAndroid = /Android/.test(ua);
+        // Try deep link first
+        var start = Date.now();
+        window.location.href = deep;
+        // After a short delay, show the page (and optionally navigate to store)
+        setTimeout(function(){
+          var elapsed = Date.now() - start;
+          // Keep user on this page to choose store; do not auto-jump without confirmed URLs
+        }, 1500);
+      })();
+    </script>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Open Howdy to accept your invite</h2>
+      <p>If the app doesn't open automatically, tap the button:</p>
+      <p><a class="btn" href="${deep}">Open in the app</a></p>
+      <p class="muted">Don't have the app yet? Install it, then return to this link.</p>
+      <div class="row">
+        <a class="store" href="https://apps.apple.com/" target="_blank" rel="noopener">Get for iOS</a>
+        <a class="store" href="https://play.google.com/store" target="_blank" rel="noopener">Get for Android</a>
+      </div>
+    </div>
+  </body>
+</html>`);
+});
+
+// Friendly alias
+app.get('/invite/:token', (req, res) => {
+  const token = String(req.params.token || '');
+  const qs = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+  return res.redirect(302, `/i/${encodeURIComponent(token)}${qs}`);
+});
 
 /* ===== Routers ===== */
 app.use('/devices', devicesPublicRouter);
