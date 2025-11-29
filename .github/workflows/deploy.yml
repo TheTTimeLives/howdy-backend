@@ -1,0 +1,117 @@
+name: backend-deploy
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/**'
+      - 'Dockerfile'
+      - 'package.json'
+      - 'tsconfig.json'
+      - 'src/**'
+      - 'public/**'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to Cloud Run
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: .
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set working directory to backend
+        run: echo "Entering howdy-backend"
+        working-directory: howdy-backend
+
+      - name: Set up gcloud auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ secrets.GCP_RUN_REGION }}-docker.pkg.dev -q
+
+      - name: Compute image name
+        id: meta
+        run: |
+          REPO="${{ secrets.GCP_ARTIFACT_REPOSITORY }}"
+          if [ -z "$REPO" ]; then REPO="howdy"; fi
+          IMAGE="${{ secrets.GCP_RUN_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/$REPO/howdy-backend:${{ github.sha }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+        working-directory: howdy-backend
+
+      - name: Build container
+        run: docker build -t "${{ steps.meta.outputs.image }}" .
+        working-directory: howdy-backend
+
+      - name: Push container
+        run: docker push "${{ steps.meta.outputs.image }}"
+        working-directory: howdy-backend
+
+      - name: Deploy to Cloud Run
+        env:
+          SERVICE: ${{ secrets.GCP_RUN_SERVICE }}
+          REGION: ${{ secrets.GCP_RUN_REGION }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          # Runtime env (optional, set in repo/env secrets)
+          NODE_ENV: production
+          ENABLE_TRANSCRIPT_BACKFILL: ${{ secrets.ENABLE_TRANSCRIPT_BACKFILL }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+          AGORA_APP_ID: ${{ secrets.AGORA_APP_ID }}
+          AGORA_APP_CERTIFICATE: ${{ secrets.AGORA_APP_CERTIFICATE }}
+          AGORA_REC_CUSTOMER_ID: ${{ secrets.AGORA_REC_CUSTOMER_ID }}
+          AGORA_REC_CUSTOMER_CERT: ${{ secrets.AGORA_REC_CUSTOMER_CERT }}
+          AGORA_REC_REGION: ${{ secrets.AGORA_REC_REGION }}
+          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+          GCS_PREFIX: ${{ secrets.GCS_PREFIX }}
+          TRANSCRIPTS_PREFIX: ${{ secrets.TRANSCRIPTS_PREFIX }}
+          ARCHIVE_TRANSCRIPTS_TO_GCS: ${{ secrets.ARCHIVE_TRANSCRIPTS_TO_GCS }}
+          ASSEMBLYAI_API_KEY: ${{ secrets.ASSEMBLYAI_API_KEY }}
+          ASSEMBLYAI_WEBHOOK_SECRET: ${{ secrets.ASSEMBLYAI_WEBHOOK_SECRET }}
+          REVENUECAT_KEY: ${{ secrets.REVENUECAT_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          FIREBASE_BUCKET: ${{ secrets.FIREBASE_BUCKET }}
+        run: |
+          set -euo pipefail
+          svc="${SERVICE:-howdy-backend}"
+          if [ -z "${REGION:-}" ]; then
+            echo "GCP_RUN_REGION secret is required"; exit 1
+          fi
+          # Build env list dynamically (include only non-empty)
+          ENV_LIST="NODE_ENV=production"
+          add_var() { v="$1"; val="${!v:-}"; if [ -n "$val" ]; then val="${val//,/\\,}"; ENV_LIST="$ENV_LIST,$v=$val"; fi }
+          for v in ENABLE_TRANSCRIPT_BACKFILL JWT_SECRET STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET \
+                   AGORA_APP_ID AGORA_APP_CERTIFICATE AGORA_REC_CUSTOMER_ID AGORA_REC_CUSTOMER_CERT AGORA_REC_REGION \
+                   GCS_BUCKET GCS_PREFIX TRANSCRIPTS_PREFIX ARCHIVE_TRANSCRIPTS_TO_GCS \
+                   ASSEMBLYAI_API_KEY ASSEMBLYAI_WEBHOOK_SECRET REVENUECAT_KEY \
+                   SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS OPENAI_API_KEY FIREBASE_BUCKET; do
+            add_var "$v"
+          done
+          gcloud run deploy "$svc" \
+            --image "$IMAGE" \
+            --region "$REGION" \
+            --allow-unauthenticated \
+            --port 5000 \
+            --set-env-vars "$ENV_LIST"
+*** End Patch ***!
+

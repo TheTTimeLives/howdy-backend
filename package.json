@@ -4,7 +4,9 @@
   "main": "index.js",
   "scripts": {
     "start": "ts-node src/index.ts",
-    "dev": "ts-node src/index.ts"
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start:prod": "node dist/index.js"
   },
   "dependencies": {
     "agora-access-token": "^2.0.4",
