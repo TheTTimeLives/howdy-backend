@@ -2,7 +2,8 @@ name: backend-deploy
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - '**'
     paths:
       - '.github/workflows/**'
       - 'Dockerfile'
@@ -28,10 +29,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set working directory to backend
-        run: echo "Entering howdy-backend"
-        working-directory: howdy-backend
-
       - name: Set up gcloud auth
         uses: google-github-actions/auth@v2
         with:
@@ -52,15 +49,12 @@ jobs:
           if [ -z "$REPO" ]; then REPO="howdy"; fi
           IMAGE="${{ secrets.GCP_RUN_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/$REPO/howdy-backend:${{ github.sha }}"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-        working-directory: howdy-backend
 
       - name: Build container
         run: docker build -t "${{ steps.meta.outputs.image }}" .
-        working-directory: howdy-backend
 
       - name: Push container
         run: docker push "${{ steps.meta.outputs.image }}"
-        working-directory: howdy-backend
 
       - name: Deploy to Cloud Run
         env:
