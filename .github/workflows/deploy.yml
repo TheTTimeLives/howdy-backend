@@ -1,4 +1,4 @@
-name: backend-deploy
+name: Deploy Backend
 
 on:
   push:
@@ -11,7 +11,10 @@ on:
       - 'tsconfig.json'
       - 'src/**'
       - 'public/**'
-  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   deploy:
