@@ -17,7 +17,7 @@ matchActionsRouter.post('/accept', async (req, res) => {
     return res.status(400).json({ error: 'No pending match' });
   }
 
-  await docRef.update({ state: 'match-accepted-pending', accepted: true });
+  await docRef.update({ state: 'match-accepted-pending', accepted: true, timestamp: Date.now() });
 
   const partnerRef = db.collection('matchQueue').doc(data.partnerId);
   const partnerDoc = await partnerRef.get();

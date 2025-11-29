@@ -13,33 +13,39 @@ export async function sendVoipNotification(uid: string, payload: any) {
 
   console.log(`📲 Sending VoIP to ${tokens.length} device(s):`, tokens);
 
+  // Send DATA-ONLY high-priority messages so the app's background handler
+  // can present the native call UI (CallKit/ConnectionService). Avoid the
+  // notification field on Android which would bypass the background isolate.
   const messages = tokens.map(token => ({
-  token,
-  notification: {
-    title: payload.title,
-    body: payload.body,
-  },
-  data: payload.data,
-  android: {
-    priority: 'high' as const, // ✅ FIX HERE
-    notification: {
-      channelId: 'call_channel',
-      sound: 'default',
+    token,
+    // Include title/body inside data for client-side display if needed
+    data: {
+      ...(payload?.data || {}),
+      title: String(payload?.title || ''),
+      body: String(payload?.body || ''),
     },
-  },
-  apns: {
-    headers: {
-      'apns-priority': '10',
-    },
-    payload: {
-      aps: {
+    android: {
+      priority: 'high' as const,
+      // Keep channel hint for devices that choose to surface anything
+      notification: {
+        channelId: 'call_channel',
         sound: 'default',
-        category: 'incoming_call',
-        contentAvailable: true,
       },
     },
-  },
-}));
+    apns: {
+      headers: {
+        // Background data push; the app will raise CallKit locally
+        'apns-push-type': 'background',
+        'apns-priority': '10',
+      },
+      payload: {
+        aps: {
+          // 1 tells iOS it's a background update
+          contentAvailable: 1 as any,
+        },
+      },
+    },
+  }));
 
 
   try {

@@ -166,6 +166,37 @@ callsRouter.post('/start', async (req, res) => {
 
     await ensureCallDoc(channelName, [caller, ...participants]);
 
+    // Best-effort: trigger icebreaker generation once at call setup so both clients see the same prompt.
+    // Trigger early (fire-and-forget) before any early returns from recording flow.
+    try {
+      const base = process.env.API_BASE_URL || '';
+      if (base) {
+        const fetchDyn = (await import('node-fetch')).default as any;
+        const url = `${base}/calls/${encodeURIComponent(channelName)}/icebreaker`;
+        const auth = (req as any).headers?.authorization || '';
+        (async () => {
+          try {
+            console.log('[ICEBREAKER] scheduling from /calls/start', { channelName, caller, hasAuth: !!auth });
+            const r = await fetchDyn(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: auth },
+              body: '{}',
+            });
+            if (!r.ok) {
+              const t = await r.text();
+              console.warn('[ICEBREAKER] schedule non-200 from /calls/start', { status: r.status, body: t });
+            }
+          } catch (e: any) {
+            console.warn('[ICEBREAKER] schedule error (ignored)', String(e?.message || e));
+          }
+        })();
+      } else {
+        console.warn('[ICEBREAKER] cannot schedule; missing API_BASE_URL');
+      }
+    } catch (e) {
+      console.warn('[ICEBREAKER] scheduling block threw (ignored)', e);
+    }
+
     // Auto-start recording with race-proof logic
     let lockId: string | null = null;
     try {
@@ -222,6 +253,27 @@ callsRouter.post('/start', async (req, res) => {
     } catch (e) {
       console.error('❌ /calls/start recording block error', e);
       return res.json({ ok: true, recording: { started: false } });
+    }
+
+    // Best-effort: trigger icebreaker generation once at call setup so both clients see the same prompt.
+    // Do not block the response; fire-and-forget with auth header.
+    try {
+      const base = process.env.API_BASE_URL || '';
+      if (base) {
+        const fetchDyn = (await import('node-fetch')).default as any;
+        fetchDyn(`${base}/calls/${encodeURIComponent(channelName)}/icebreaker`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: req.headers.authorization || '',
+          },
+          body: '{}',
+        }).catch((e: any) => {
+          console.warn('⚠️ Failed to trigger icebreaker generation at start (ignored):', String(e?.message || e));
+        });
+      }
+    } catch (e) {
+      console.warn('⚠️ Error scheduling icebreaker generation (ignored):', e);
     }
   } catch (e) {
     console.error('❌ /calls/start error', e);
@@ -348,6 +400,162 @@ callsRouter.post('/:channelName/end', async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     console.error('❌ /calls/:channelName/end error', e);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+});
+
+// ========= Icebreaker (GPT-backed with fallback) =========
+callsRouter.post('/:channelName/icebreaker', async (req, res) => {
+  try {
+    const authUid = String((req as any).uid || '');
+    const { channelName } = req.params;
+    if (!channelName) return res.status(400).json({ error: 'Missing channelName' });
+
+    console.log('[ICEBREAKER] request', { channelName, requester: authUid });
+    const startTs = Date.now();
+
+    const ref = channelDocRef(channelName);
+    const snap = await ref.get();
+    const data = snap.data() || {};
+
+    // If already generated, return it
+    const existingText = (data as any)?.icebreaker?.text;
+    if (existingText) {
+      const existingSource = (data as any)?.icebreaker?.source || 'cached';
+      console.log('[ICEBREAKER] already present', { channelName, source: existingSource });
+      return res.json({ text: String(existingText), source: String(existingSource) });
+    }
+
+    let participants: string[] = Array.from(
+      new Set((data.participants || []).map((x: any) => String(x || '').trim()).filter((s: string) => s.length > 0))
+    );
+
+    // Wait briefly (up to ~6.4s) for both participants to be recorded
+    if (participants.length < 2) {
+      for (let i = 0; i < 8 && participants.length < 2; i++) {
+        console.log('[ICEBREAKER] waiting for participants', { channelName, count: participants.length, attempt: i + 1 });
+        await delay(800);
+        const again = await ref.get();
+        const d2 = again.data() || {};
+        participants = Array.from(
+          new Set((d2.participants || []).map((x: any) => String(x || '').trim()).filter((s: string) => s.length > 0))
+        );
+      }
+    }
+
+    if (participants.length === 0) {
+      // Persist fallback and return
+      const text = 'What do you do for fun?';
+      await ref.set(
+        { icebreaker: { text, source: 'fallback_no_participants', generatedAt: Date.now(), requestedBy: authUid } },
+        { merge: true }
+      );
+      return res.json({ text, source: 'fallback', reason: 'no_participants' });
+    }
+
+    let a = participants[0];
+    let b = participants.find((p) => p !== a) || participants[0];
+
+    // Load bios for both
+    const [aMeta, bMeta] = await Promise.all([
+      db.collection('user_metadata').doc(a).get(),
+      db.collection('user_metadata').doc(b).get(),
+    ]);
+    const aBio = (aMeta.data()?.bioResponses as Record<string, unknown> | undefined) || {};
+    const bBio = (bMeta.data()?.bioResponses as Record<string, unknown> | undefined) || {};
+    console.log('[ICEBREAKER] bios loaded', {
+      channelName,
+      a,
+      b,
+      aFields: Object.keys(aBio).length,
+      bFields: Object.keys(bBio).length,
+    });
+
+    // Try GPT with a firm timeout (9.5s here; client also uses 10s)
+    const key = process.env.OPENAI_API_KEY || '';
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 9500);
+
+    let text: string | null = null;
+    let source = 'fallback';
+
+    if (key) {
+      try {
+        console.log('[ICEBREAKER] calling OpenAI', { channelName });
+        const messages = [
+          {
+            role: 'system',
+            content:
+              "You are Howdy's friendly icebreaker assistant. Output EXACTLY ONE short, natural question. If there is a clear shared topic between the two users' bios, ask about that topic. Keep it safe and PII-free.",
+          },
+          {
+            role: 'user',
+            content:
+              `User A bioResponses (JSON): ${JSON.stringify(aBio)}\nUser B bioResponses (JSON): ${JSON.stringify(
+                bBio
+              )}\n\nTask: Find a shared hobby/interest if possible and ask one friendly question about it. If there is no meaningful overlap, respond with exactly: What do you do for fun?`,
+          },
+        ];
+        const payload = {
+          model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+          temperature: 0.6,
+          max_tokens: 50,
+          messages,
+        };
+        const r = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${key}`,
+            'Content-Type': 'application/json',
+            ...(process.env.OPENAI_ORG ? { 'OpenAI-Organization': process.env.OPENAI_ORG as string } : {}),
+            ...(process.env.OPENAI_PROJECT ? { 'OpenAI-Project': process.env.OPENAI_PROJECT as string } : {}),
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        if (r.ok) {
+          const j: any = await r.json();
+          const content = j?.choices?.[0]?.message?.content?.toString()?.trim();
+          if (content && content.length > 0) {
+            text = content;
+            source = 'gpt';
+            console.log('[ICEBREAKER] GPT success', { channelName, latencyMs: Date.now() - startTs });
+          }
+        } else {
+          console.warn('⚠️ OpenAI icebreaker API error', await r.text());
+        }
+      } catch (e) {
+        clearTimeout(timer);
+        console.warn('⚠️ OpenAI icebreaker request failed or timed out; falling back', e);
+      }
+    } else {
+      clearTimeout(timer);
+    }
+
+    if (!text || !text.trim()) {
+      text = 'What do you do for fun?';
+      source = 'fallback';
+      console.log('[ICEBREAKER] using fallback', { channelName, latencyMs: Date.now() - startTs });
+    }
+
+    await ref.set(
+      {
+        icebreaker: {
+          text,
+          source,
+          generatedAt: Date.now(),
+          requestedBy: authUid,
+          a: a,
+          b: b,
+        },
+      },
+      { merge: true }
+    );
+
+    return res.json({ text, source });
+  } catch (e) {
+    console.error('❌ /calls/:channelName/icebreaker error', e);
     return res.status(500).json({ error: 'Internal Error' });
   }
 });

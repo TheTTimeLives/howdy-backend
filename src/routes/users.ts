@@ -222,6 +222,27 @@ try {
 
 });
 
+// POST /users/device-status  { platform, policyAccessGranted, interruptionFilter, ringerMode, reportedAt }
+usersRouter.post('/device-status', async (req, res) => {
+  const uid = (req as any).uid as string;
+  try {
+    const payload = {
+      deviceStatus: {
+        platform: String(req.body?.platform || 'unknown'),
+        policyAccessGranted: !!req.body?.policyAccessGranted,
+        interruptionFilter: typeof req.body?.interruptionFilter === 'number' ? req.body.interruptionFilter : null,
+        ringerMode: typeof req.body?.ringerMode === 'number' ? req.body.ringerMode : null,
+        reportedAt: typeof req.body?.reportedAt === 'number' ? req.body.reportedAt : Date.now(),
+      }
+    };
+    await db.collection('user_metadata').doc(uid).set(payload, { merge: true });
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('[device-status] failed', e);
+    return res.status(500).json({ error: 'Failed to record device status' });
+  }
+});
+
 usersRouter.post('/metadata', async (req, res) => {
   const uid = (req as any).uid;
   const { username, photoUrl } = req.body;

@@ -236,6 +236,50 @@ try {
     });
     console.log('⏰ Transcript backfill cron scheduled for 02:30 daily');
   }
+
+  // Lightweight TTL cleanup for stale matchQueue entries
+  const cron2 = require('node-cron');
+  cron2.schedule('*/1 * * * *', async () => {
+    try {
+      const { db } = await import('./firebase');
+      const cutoffPending = Date.now() - 60_000; // 60s for match-pending
+      const cutoffAccepted = Date.now() - 120_000; // 120s for match-accepted-pending
+
+      const pendingSnap = await db.collection('matchQueue')
+        .where('state', '==', 'match-pending')
+        .where('accepted', '==', false)
+        .where('timestamp', '<', cutoffPending)
+        .get();
+
+      for (const doc of pendingSnap.docs) {
+        await doc.ref.update({
+          state: 'searching',
+          partnerId: null,
+          channelName: null,
+          accepted: false,
+          timestamp: Date.now(),
+        });
+      }
+
+      const acceptedSnap = await db.collection('matchQueue')
+        .where('state', '==', 'match-accepted-pending')
+        .where('timestamp', '<', cutoffAccepted)
+        .get();
+
+      for (const doc of acceptedSnap.docs) {
+        await doc.ref.update({
+          state: 'searching',
+          partnerId: null,
+          channelName: null,
+          accepted: false,
+          timestamp: Date.now(),
+        });
+      }
+    } catch (e) {
+      console.warn('⚠️ matchQueue TTL cleanup failed:', e);
+    }
+  });
+  console.log('⏰ matchQueue TTL cleanup scheduled every minute');
 } catch (e) {
   console.warn('⚠️ Failed to schedule transcript backfill cron:', e);
 }

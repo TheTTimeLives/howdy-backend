@@ -1,5 +1,6 @@
 import express from 'express';
 import { db, auth } from '../firebase';
+import admin from 'firebase-admin';
 import { verifyJwt } from '../verifyJwt';
 import crypto from 'crypto';
 
@@ -90,10 +91,82 @@ function logCtx(ctx: any, msg: string, extra?: Record<string, any>) {
 // PUBLIC: device login challenge { deviceId }
 devicesPublicRouter.post('/login/challenge', async (req, res) => {
   const deviceId = String(req.body?.deviceId || '').trim();
+  const appSetId = typeof req.body?.appSetId === 'string' ? String(req.body.appSetId).trim() : '';
+  const publicKeyJwk = req.body?.publicKeyJwk;
   if (!deviceId) return res.status(400).json({ error: 'Missing deviceId' });
   try {
-    const idxRef = db.collection('device_index').doc(deviceId);
-    const idxSnap = await idxRef.get();
+    let idxRef = db.collection('device_index').doc(deviceId);
+    let idxSnap = await idxRef.get();
+
+    // If not found, attempt publisher-scoped anchor recovery via appSetId
+    if (!idxSnap.exists && appSetId && publicKeyJwk) {
+      const q = await db.collection('device_index')
+        .where('appSetId', '==', appSetId)
+        .where('status', '==', 'active')
+        .limit(2)
+        .get();
+      if (q.size === 1) {
+        const oldDoc = q.docs[0];
+        const oldData = oldDoc.data() as any;
+        const oldDeviceId = oldDoc.id;
+        const uid = String(oldData?.uid || '');
+        if (uid) {
+          // Rotate: create new index doc under new deviceId, mark old as rotated, update user_metadata.allowedDevice
+          const now = Date.now();
+          const newIdxRef = db.collection('device_index').doc(deviceId);
+          await db.runTransaction(async (tx) => {
+            const metaRef = db.collection('user_metadata').doc(uid);
+            const metaSnap = await tx.get(metaRef);
+            const meta = (metaSnap.data() || {}) as any;
+            const allowed = meta.allowedDevice || {};
+
+            // Create/overwrite new index doc
+            tx.set(newIdxRef, {
+              ...oldData,
+              deviceId,
+              publicKeyJwk,
+              appSetId: appSetId || oldData.appSetId || null,
+              registeredAt: now,
+              lastSeenAt: null,
+              status: 'active',
+              prevFrom: oldDeviceId,
+              loginChallenge: admin.firestore.FieldValue.delete(), // will set after txn
+            }, { merge: true });
+
+            // Mark old as rotated
+            tx.set(oldDoc.ref, {
+              status: 'rotated',
+              rotatedAt: now,
+              prevKeys: admin.firestore.FieldValue.arrayUnion({
+                deviceId: oldDeviceId,
+                publicKeyJwk: oldData?.publicKeyJwk || null,
+                rotatedAt: now,
+              }),
+            }, { merge: true });
+
+            // Update user's allowedDevice
+            const prevIds = Array.isArray(allowed.previousDeviceIds) ? allowed.previousDeviceIds : [];
+            tx.set(metaRef, {
+              allowedDevice: {
+                ...allowed,
+                deviceId,
+                publicKeyJwk,
+                previousDeviceIds: admin.firestore.FieldValue.arrayUnion(oldDeviceId),
+                anchors: {
+                  ...(allowed.anchors || {}),
+                  appSetId: appSetId || (allowed.anchors?.appSetId ?? null),
+                },
+              }
+            }, { merge: true });
+          });
+          // Re-fetch new idxRef for challenge write
+          idxRef = newIdxRef;
+          idxSnap = await idxRef.get();
+        }
+      }
+      // If zero or multiple matches, fall through and return 404 below
+    }
+
     if (!idxSnap.exists) return res.status(404).json({ error: 'Device not found' });
     const idx = (idxSnap.data() || {}) as any;
     if (idx.status !== 'active' || !idx.uid || !idx.publicKeyJwk) {
@@ -190,6 +263,8 @@ devicesRouter.post('/register', async (req, res) => {
   const model = String(req.body?.model || '').trim() || null;
   const appVersion = String(req.body?.appVersion || '').trim() || null;
   const pushToken = String(req.body?.pushToken || '').trim() || null;
+  const appSetId = typeof req.body?.appSetId === 'string' ? String(req.body.appSetId).trim() : null;
+  const stableDeviceId = typeof req.body?.stableDeviceId === 'string' ? String(req.body.stableDeviceId).trim() : null;
 
   if (!deviceId || !publicKeyJwk || !platform) {
     logCtx(ctx, 'invalid body', { platform, deviceIdLen: deviceId?.length || 0, hasJwk: !!publicKeyJwk });
@@ -231,6 +306,11 @@ devicesRouter.post('/register', async (req, res) => {
       deviceId, publicKeyJwk, platform, osVersion, model, appVersion, pushToken,
       registeredAt: now, lastSeenAt: null as number | null, verifiedAt: null as number | null,
       status: 'active' as const,
+      anchors: {
+        appSetId: appSetId,
+        stableDeviceId: stableDeviceId,
+      },
+      previousDeviceIds: [] as string[],
     };
 
     await metaRef.set({ allowedDevice, deviceChallenge: null }, { merge: true });
@@ -247,6 +327,8 @@ devicesRouter.post('/register', async (req, res) => {
       registeredAt: now,
       lastSeenAt: null,
       loginChallenge: null,
+      appSetId: appSetId,
+      stableDeviceId: stableDeviceId,
     }, { merge: true });
     logCtx(ctx, 'register ok', { platform, osVersion, hasPush: !!pushToken });
     return res.status(200).json({ ok: true });

@@ -53,6 +53,7 @@ export const matchUsers = async () => {
           partnerId: candidateId,
           channelName,
           accepted: false,
+          timestamp: Date.now(),
           topic: candidate.data().prefs?.topic || null, // ✅ show THEIR topic
         }),
         queueRef.doc(candidateId).update({
@@ -60,6 +61,7 @@ export const matchUsers = async () => {
           partnerId: uid,
           channelName,
           accepted: false,
+          timestamp: Date.now(),
           topic: user.data().prefs?.topic || null, // ✅ show THEIR topic
         }),
       ]);
