@@ -113,5 +113,4 @@ jobs:
             --allow-unauthenticated \
             --port 5000 \
             --set-env-vars "$ENV_LIST"
-*** End Patch ***!
 
