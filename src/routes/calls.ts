@@ -281,6 +281,124 @@ callsRouter.post('/start', async (req, res) => {
   }
 });
 
+// List active calls that include any member of the specified group
+// GET /calls/active?groupId=abc123
+callsRouter.get('/active', async (req, res) => {
+  try {
+    const groupId = String(req.query.groupId || '').trim();
+    if (!groupId) return res.status(400).json({ error: 'Missing groupId' });
+
+    // load group members (collect UIDs)
+    const membersSnap = await db.collection('groups').doc(groupId).collection('members').get();
+    const memberUids = new Set<string>();
+    for (const m of membersSnap.docs) {
+      const d = m.data() || {};
+      const uid = String(d.uid || m.id || '').trim();
+      if (uid) memberUids.add(uid);
+    }
+
+    // fetch recent active calls (filter server-side in app layer)
+    const callsSnap = await db
+      .collection('calls')
+      .where('active', '==', true)
+      .orderBy('startedAt', 'desc')
+      .limit(200)
+      .get();
+
+    const now = Date.now();
+    const rows: any[] = [];
+    for (const doc of callsSnap.docs) {
+      const data = doc.data() || {};
+      const rawParts: any[] = Array.isArray((data as any).participants)
+        ? (((data as any).participants as any[]) || [])
+        : [];
+      const participantsSet = new Set<string>(
+        rawParts.map((x: any) => String(x ?? '')).filter((s: string) => s.length > 0)
+      );
+      const participants: string[] = Array.from(participantsSet);
+      // include if any participant is in group
+      const intersects = participants.some((p) => memberUids.has(p));
+      if (!intersects) continue;
+      const startedAt = Number(data.startedAt || 0);
+      rows.push({
+        channelName: String(data.channelName || String(doc.id).replace(/^chan_/, '')),
+        participants,
+        orgParticipants: participants.filter((p) => memberUids.has(p)),
+        startedAt,
+        durationMs: startedAt > 0 ? Math.max(0, now - startedAt) : null,
+        lastSeenAt: Number(data.lastSeenAt || 0) || null,
+        icebreaker: (data.icebreaker && data.icebreaker.text) ? String(data.icebreaker.text) : null,
+      });
+    }
+
+    return res.json({ calls: rows });
+  } catch (e) {
+    console.error('❌ /calls/active error', e);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+});
+
+// List recent ended calls that included a member of the specified group
+// GET /calls/history?groupId=abc123&limit=100
+callsRouter.get('/history', async (req, res) => {
+  try {
+    const groupId = String(req.query.groupId || '').trim();
+    const limitRaw = Number(req.query.limit ?? 100);
+    const limit = isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 500) : 100;
+    if (!groupId) return res.status(400).json({ error: 'Missing groupId' });
+
+    // Group members
+    const membersSnap = await db.collection('groups').doc(groupId).collection('members').get();
+    const memberUids = new Set<string>();
+    for (const m of membersSnap.docs) {
+      const d = m.data() || {};
+      const uid = String(d.uid || m.id || '').trim();
+      if (uid) memberUids.add(uid);
+    }
+
+    // Fetch recent ended calls (active == false) by endedAt desc
+    const callsSnap = await db
+      .collection('calls')
+      .where('active', '==', false)
+      .orderBy('endedAt', 'desc')
+      .limit(limit)
+      .get();
+
+    const rows: any[] = [];
+    for (const doc of callsSnap.docs) {
+      const data = doc.data() || {};
+      const rawParts: any[] = Array.isArray((data as any).participants)
+        ? (((data as any).participants as any[]) || [])
+        : [];
+      const participants = Array.from(
+        new Set<string>(rawParts.map((x: any) => String(x ?? '')).filter((s: string) => s.length > 0))
+      );
+      const intersects = participants.some((p) => memberUids.has(p));
+      if (!intersects) continue;
+
+      const startedAt = Number(data.startedAt || 0);
+      const endedAt = Number(data.endedAt || 0);
+      const durationMs =
+        startedAt > 0 && endedAt > 0 && endedAt >= startedAt ? endedAt - startedAt : null;
+
+      rows.push({
+        channelName: String(data.channelName || String(doc.id).replace(/^chan_/, '')),
+        participants,
+        orgParticipants: participants.filter((p) => memberUids.has(p)),
+        startedAt: startedAt || null,
+        endedAt: endedAt || null,
+        durationMs,
+        icebreaker: (data.icebreaker && data.icebreaker.text) ? String(data.icebreaker.text) : null,
+      });
+    }
+
+    return res.json({ calls: rows });
+  } catch (e) {
+    console.error('❌ /calls/history error', e);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+});
+
 callsRouter.get('/:channelName/status', async (req, res) => {
   try {
     const { channelName } = req.params;

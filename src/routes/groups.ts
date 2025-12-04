@@ -204,7 +204,7 @@ groupsRouter.post('/:groupId/members', async (req, res) => {
     const groupDoc = await db.collection('groups').doc(groupId).get();
     const groupType = (groupDoc.data()?.type || 'carer').toString();
     const requestedRole = String(role);
-    const baseAssignable = ['super-admin', 'admin', 'team-lead', 'volunteer', 'member']; // carer/viewer removed globally
+    const baseAssignable = ['super-admin', 'admin', 'team-lead', 'coordinator', 'staff', 'volunteer', 'viewer', 'member']; // expanded org roles
     const carerAssignable = ['admin', 'member'];
     const allowedRoles = groupType === 'carer' ? carerAssignable : baseAssignable;
     if (!allowedRoles.includes(requestedRole)) {
@@ -442,7 +442,7 @@ groupsRouter.post('/:groupId/invite', async (req, res) => {
     const groupDoc = await db.collection('groups').doc(groupId).get();
     if (!groupDoc.exists) return res.status(404).json({ error: 'Group not found' });
     const groupType = (groupDoc.data()?.type || 'carer').toString();
-    const baseAssignable = ['super-admin', 'admin', 'team-lead', 'volunteer', 'member'];
+    const baseAssignable = ['super-admin', 'admin', 'team-lead', 'coordinator', 'staff', 'volunteer', 'viewer', 'member'];
     const carerAssignable = ['admin', 'member'];
     const allowedRoles = groupType === 'carer' ? carerAssignable : baseAssignable;
     if (!allowedRoles.includes(role)) {

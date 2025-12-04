@@ -42,6 +42,10 @@ const YOTI_KEY = fs.readFileSync(YOTI_KEY_FILE, 'utf8');
 const YOTI_SUCCESS_URL = process.env.YOTI_SUCCESS_URL!;
 const YOTI_ERROR_URL = process.env.YOTI_ERROR_URL!;
 const YOTI_WEBHOOK_AUTH = process.env.YOTI_WEBHOOK_AUTH || 'howdy:yoti';
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
+const YOTI_WEBHOOK_URL =
+  process.env.YOTI_WEBHOOK_URL ||
+  (PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/yoti/webhook` : undefined);
 
 if (isSandbox) {
   // 🔁 Redirect all IDVClient traffic to sandbox API
@@ -78,23 +82,35 @@ console.log(`🌍 Environment: ${isSandbox ? 'sandbox' : 'production'}`);
       .withAllowHandoff(true)
       .build();
 
-    // const notificationConfig = new NotificationConfigBuilder()
-    //   .withEndpoint('https://your-domain.com/yoti-webhook')
-    //   .withAuthTypeBasic()
-    //   .withAuthToken(YOTI_WEBHOOK_AUTH)
-    //   .forSessionCompletion()
-    //   .build();
+    // ✅ Build webhook notification config when public URL is available
+    let notificationConfig: any | undefined;
+    if (YOTI_WEBHOOK_URL) {
+      notificationConfig = new NotificationConfigBuilder()
+        .withEndpoint(YOTI_WEBHOOK_URL)
+        .withAuthTypeBasic()
+        .withAuthToken(YOTI_WEBHOOK_AUTH)
+        .forSessionCompletion()
+        .build();
+      console.log(`🔔 Yoti webhook configured: ${YOTI_WEBHOOK_URL}`);
+    } else {
+      console.warn('⚠️ Yoti webhook NOT configured (no PUBLIC_BASE_URL or YOTI_WEBHOOK_URL). Status will rely on polling.');
+    }
 
-    const sessionSpec = new SessionSpecificationBuilder()
+    // Build session spec; attach notifications only if available
+    let specBuilder = new SessionSpecificationBuilder()
       .withClientSessionTokenTtl(600)
       .withUserTrackingId(uid)
       .withRequestedCheck(new RequestedDocumentAuthenticityCheckBuilder().build())
       .withRequestedCheck(new RequestedLivenessCheckBuilder().forStaticLiveness().withMaxRetries(3).build())
       .withRequestedCheck(new RequestedFaceMatchCheckBuilder().withManualCheckFallback().build())
       .withRequestedTask(new RequestedTextExtractionTaskBuilder().withManualCheckFallback().build())
-      .withSdkConfig(sdkConfig)
-    //   .withNotifications(notificationConfig)
-      .build();
+      .withSdkConfig(sdkConfig);
+
+    if (notificationConfig) {
+      specBuilder = specBuilder.withNotifications(notificationConfig);
+    }
+
+    const sessionSpec = specBuilder.build();
 
     const sessionResult = await idvClient.createSession(sessionSpec);
     const sessionId = sessionResult.getSessionId();
