@@ -168,15 +168,15 @@ console.log(`🌍 Environment: ${isSandbox ? 'sandbox' : 'production'}`);
       const responseConfig = new SandboxResponseConfigBuilder()
         .withCheckReports(
           new SandboxCheckReportsBuilder()
-            // .withDocumentAuthenticityCheck(docCheck)
-            // .withDocumentFaceMatchCheck(faceCheck)
-            // .withLivenessCheck(livenessCheck)
-            // .withDocumentTextDataCheck(textCheck)
+            .withDocumentAuthenticityCheck(docCheck)
+            .withDocumentFaceMatchCheck(faceCheck)
+            .withLivenessCheck(livenessCheck)
+            .withDocumentTextDataCheck(textCheck)
             .build()
         )
         .withTaskResults(
           new SandboxTaskResultsBuilder()
-            // .withDocumentTextDataExtractionTask(textExtraction)
+            .withDocumentTextDataExtractionTask(textExtraction)
             .build()
         )
         .build();
@@ -197,8 +197,36 @@ yotiRouter.get('/status', async (req, res) => {
   const uid = (req as any).uid;
 
   try {
-    const doc = await db.collection('user_metadata').doc(uid).get();
-    const status = doc.data()?.verificationStatus ?? 'awaiting';
+    const metaRef = db.collection('user_metadata').doc(uid);
+    const doc = await metaRef.get();
+    let status = doc.data()?.verificationStatus ?? 'awaiting';
+    const sessionId = doc.data()?.yotiSessionId;
+
+    // Proactive check if still processing and we have a session
+    if (status === 'processing' && sessionId) {
+      try {
+        const sessionResult = await idvClient.getSession(sessionId);
+        const state = sessionResult.getState();
+        
+        if (state === 'COMPLETED') {
+          const checks = sessionResult.getChecks();
+          let approved = true;
+          for (const check of checks) {
+            const recommendation = check.getReport()?.getRecommendation()?.getValue();
+            if (recommendation !== 'APPROVE') {
+              approved = false;
+              break;
+            }
+          }
+          status = approved ? 'approved' : 'denied';
+          await metaRef.update({ verificationStatus: status });
+          console.log(`[YOTI /status] Proactively updated status for ${uid} to ${status}`);
+        }
+      } catch (err) {
+        console.warn(`[YOTI /status] Failed to fetch session ${sessionId} for uid ${uid}:`, err);
+      }
+    }
+
     res.status(200).json({ status });
   } catch (e) {
     console.error('❌ Failed to fetch Yoti status:', e);

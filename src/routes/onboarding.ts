@@ -3,17 +3,17 @@ import express from 'express';
 import { db } from '../firebase';
 import { verifyJwt } from '../verifyJwt';
 
-type Stage = 'bio' | 'interests' | 'profile' | 'complete';
+type Stage = 'bio' | 'intent' | 'profile' | 'complete';
 
 const STAGE_ORDER: Record<Stage, number> = {
   bio: 0,
-  interests: 1,
+  intent: 1,
   profile: 2,
   complete: 3,
 };
 
 const normalizeStage = (s: any): Stage =>
-  s === 'interests' || s === 'profile' || s === 'complete' ? s : 'bio';
+  s === 'intent' || s === 'profile' || s === 'complete' ? s : 'bio';
 
 const canAdvanceTo = (current: Stage, target: Stage): boolean => {
   if (target === 'complete' && current !== 'profile') return false;
@@ -326,7 +326,7 @@ onboardingRouter.post('/', async (req, res) => {
       (req as any).user?.uid || (req as any).userId || (req as any).uid;
     if (!requesterUid) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { bioResponses, interests, username, photoUrl, advanceTo, memberId, clearBio } =
+    const { bioResponses, interests, username, photoUrl, advanceTo, memberId, clearBio, matchingIntent } =
       (req.body ?? {}) as {
         bioResponses?: Record<string, unknown>;
         interests?: unknown[];
@@ -335,6 +335,7 @@ onboardingRouter.post('/', async (req, res) => {
         advanceTo?: Stage;
         memberId?: string;
         clearBio?: boolean;
+        matchingIntent?: 'friends' | 'romance' | 'both';
       };
 
     // Debug log: request summary (no PII)
@@ -393,6 +394,9 @@ onboardingRouter.post('/', async (req, res) => {
     }
     if (typeof photoUrl === 'string' && photoUrl.trim()) {
       metaUpdates['photoUrl'] = photoUrl.trim();
+    }
+    if (matchingIntent && ['friends', 'romance', 'both'].includes(matchingIntent)) {
+      metaUpdates['matchingIntent'] = matchingIntent;
     }
 
     const userRef = db.collection('users').doc(targetUid);

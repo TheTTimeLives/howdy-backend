@@ -5,8 +5,8 @@ import crypto from 'crypto';
 import { FieldValue } from 'firebase-admin/firestore';
 import { sendEmail } from '../utils/email';
 import { authenticator, totp } from 'otplib';
-import { verifyJwt } from '../verifyJwt';
-import { db } from '../firebase';
+import { verifyJwt, clearSessionCache } from '../verifyJwt';
+import { db, auth } from '../firebase';
 
 export const authRouter = express.Router();
 
@@ -185,11 +185,17 @@ authRouter.post('/accept-member-invite', async (req, res) => {
     await inviteDoc.ref.delete();
 
     // Issue API tokens for this new/existing member
-    const accessToken = jwt.sign({ uid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
-    const refreshToken = jwt.sign({ uid, t: 'refresh' }, process.env.JWT_SECRET!, { expiresIn: '180d' });
-    await db.collection('refresh_tokens').doc().set({ uid, token: refreshToken, createdAt: Date.now() });
+    const sid = crypto.randomUUID();
+    const accessToken = jwt.sign({ uid, sid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
+    const refreshToken = jwt.sign({ uid, t: 'refresh', sid }, process.env.JWT_SECRET!, { expiresIn: '180d' });
+    await db.collection('refresh_tokens').doc().set({ uid, token: refreshToken, sid, createdAt: Date.now() });
 
-    return res.status(200).json({ ok: true, uid, groupId: String(invite.groupId), accessToken, refreshToken });
+    // Track the login and invalidate others
+    await logLoginEvent(uid, req, 'member-invite', refreshToken, sid);
+
+    const firebaseCustomToken = await auth.createCustomToken(uid, { sid });
+
+    return res.status(200).json({ ok: true, uid, groupId: String(invite.groupId), accessToken, refreshToken, firebaseCustomToken });
   } catch (e) {
     console.error('❌ accept-member-invite failed', e);
     return res.status(500).json({ error: 'Failed to accept invite' });
@@ -236,6 +242,77 @@ function validatePasswordComplexity(password: unknown): string | null {
   if (!/[0-9]/.test(p)) return 'Password must include a number';
   if (!/[!@#$%^&*()\-_=+\[\]{};:'",.<>\/?`~|\\]/.test(p)) return 'Password must include a special character';
   return null;
+}
+
+/**
+ * Track login events across devices and logout other sessions.
+ */
+export async function logLoginEvent(uid: string, req: express.Request, method: string, currentRefreshToken?: string, sessionId?: string) {
+  const start = Date.now();
+  try {
+    const ip = (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
+    const userAgent = req.headers['user-agent'] || 'unknown';
+    const deviceInfo = req.body?.deviceInfo || {};
+    const sid = sessionId || crypto.randomUUID();
+
+    // 1. Invalidate other sessions (BACKGROUND - don't block login)
+    if (currentRefreshToken) {
+      (async () => {
+        try {
+          const tokensSnap = await db.collection('refresh_tokens')
+            .where('uid', '==', uid)
+            .get();
+          
+          const batch = db.batch();
+          let deletedCount = 0;
+          tokensSnap.docs.forEach(doc => {
+            const data = doc.data();
+            if (data.token !== currentRefreshToken) {
+              batch.delete(doc.ref);
+              deletedCount++;
+            }
+          });
+          
+          if (deletedCount > 0) {
+            await batch.commit();
+            console.log(`[AUTH] [BACKGROUND] Invalidated ${deletedCount} other sessions for uid=${uid}`);
+          }
+        } catch (err) {
+          console.error('[AUTH] [BACKGROUND] session invalidation failed:', err);
+        }
+      })();
+    }
+
+    // 2. Update metadata (AWAIT - this enforces single session via middleware)
+    await db.collection('user_metadata').doc(uid).set({
+      currentSessionId: sid,
+      lastLogin: {
+        timestamp: Date.now(),
+        ip,
+        method,
+        deviceInfo
+      }
+    }, { merge: true });
+
+    // 3. Log the login event (BACKGROUND)
+    db.collection('login_history').add({
+      uid,
+      ip,
+      userAgent,
+      deviceInfo,
+      method,
+      sessionId: sid,
+      timestamp: Date.now(),
+    }).catch(err => console.error('[AUTH] Failed to log login history:', err));
+
+    clearSessionCache(uid);
+
+    console.log(`[AUTH] logLoginEvent primary tasks completed for uid=${uid} sid=${sid} in ${Date.now() - start}ms`);
+    return sid;
+  } catch (e) {
+    console.error('Login tracking/invalidation failed:', e);
+    return null;
+  }
 }
 
 // --------- AUTH: SIGNUP ---------
@@ -352,10 +429,18 @@ authRouter.post('/signup', async (req, res) => {
       // 'individual' – nothing extra to do
     }
 
-    const accessToken = jwt.sign({ uid: userId }, process.env.JWT_SECRET!, { expiresIn: '15m' });
-    const refreshToken = jwt.sign({ uid: userId, t: 'refresh' }, process.env.JWT_SECRET!, { expiresIn: '180d' });
-    await db.collection('refresh_tokens').doc().set({ uid: userId, token: refreshToken, createdAt: Date.now() });
-    return res.status(200).json({ accessToken, refreshToken });
+    const sid = crypto.randomUUID();
+    const refreshToken = jwt.sign({ uid: userId, t: 'refresh', sid }, process.env.JWT_SECRET!, { expiresIn: '180d' });
+    await db.collection('refresh_tokens').doc().set({ uid: userId, token: refreshToken, sid, createdAt: Date.now() });
+
+    // Track the initial login (signup) and logout others
+    const finalSid = await logLoginEvent(userId, req, 'signup', refreshToken, sid);
+    const accessToken = jwt.sign({ uid: userId, sid: finalSid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
+
+    // NEW: Issue Firebase custom token for frontend bridging
+    const firebaseCustomToken = await auth.createCustomToken(userId, { sid: finalSid });
+
+    return res.status(200).json({ accessToken, refreshToken, firebaseCustomToken });
   } catch (e) {
     console.error('Signup error:', e);
     return res.status(500).json({ error: 'Failed to create user' });
@@ -404,10 +489,18 @@ authRouter.post('/login', async (req, res) => {
       return res.status(200).json({ mfaRequired: true, methods: mfa.methods, mfaToken });
     }
 
-    const accessToken = jwt.sign({ uid: userDoc.id }, process.env.JWT_SECRET!, { expiresIn: '15m' });
-    const refreshToken = jwt.sign({ uid: userDoc.id, t: 'refresh' }, process.env.JWT_SECRET!, { expiresIn: '180d' });
-    await db.collection('refresh_tokens').doc().set({ uid: userDoc.id, token: refreshToken, createdAt: Date.now() });
-    return res.status(200).json({ accessToken, refreshToken });
+    const sid = crypto.randomUUID();
+    const refreshToken = jwt.sign({ uid: userDoc.id, t: 'refresh', sid }, process.env.JWT_SECRET!, { expiresIn: '180d' });
+    await db.collection('refresh_tokens').doc().set({ uid: userDoc.id, token: refreshToken, sid, createdAt: Date.now() });
+
+    // Track the login and logout others
+    const finalSid = await logLoginEvent(userDoc.id, req, 'password', refreshToken, sid);
+    const accessToken = jwt.sign({ uid: userDoc.id, sid: finalSid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
+
+    // NEW: Issue Firebase custom token for frontend bridging
+    const firebaseCustomToken = await auth.createCustomToken(userDoc.id, { sid: finalSid });
+
+    return res.status(200).json({ accessToken, refreshToken, firebaseCustomToken });
   } catch (e) {
     console.error('Login error:', e);
     return res.status(500).json({ error: 'Login failed' });
@@ -552,8 +645,76 @@ authRouter.post('/mfa/setup/totp/begin', verifyJwt, async (req, res) => {
       )} step=${step} ttlMs=${MFA_TMP_TTL_MS} otpauthLen=${otpauth.length}`
     );
 
-    // Return secret for manual entry as well
-    return res.status(200).json({ otpauth, secret, tx, step });
+    // Send QR code via email
+    try {
+      const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(otpauth)}`;
+      const emailHtml = `
+        <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,sans-serif;font-size:14px;color:#222;line-height:1.5;max-width:600px;">
+          <p>Hi,</p>
+          <p>You've requested to set up Multi-Factor Authentication (MFA) for your Howdy account.</p>
+          <p><strong>To complete setup:</strong></p>
+          <ol style="padding-left:20px;">
+            <li style="margin-bottom:12px;">Open your authenticator app (Google Authenticator, Microsoft Authenticator, Authy, or any TOTP-compatible app)</li>
+            <li style="margin-bottom:12px;">Scan the QR code below, or tap the link to add it directly</li>
+            <li style="margin-bottom:12px;">Enter the 6-digit code from your authenticator app in the Howdy app to verify</li>
+          </ol>
+          <div style="text-align:center;margin:24px 0;">
+            <img src="${qrCodeUrl}" alt="MFA QR Code" style="border:1px solid #ddd;border-radius:8px;padding:8px;background:#fff;" />
+          </div>
+          <p style="text-align:center;margin:16px 0;">
+            <a href="${otpauth}" style="
+              display:inline-block;
+              background:#d37f1c;
+              color:#fff;
+              padding:12px 24px;
+              border-radius:8px;
+              text-decoration:none;
+              font-weight:600;
+              margin:8px 0;">
+              Open in Authenticator App
+            </a>
+          </p>
+          <p style="font-size:12px;color:#666;margin-top:24px;">
+            <strong>Manual entry:</strong> If you can't scan the QR code, copy this secret key into your authenticator app:<br/>
+            <code style="background:#f5f5f5;padding:4px 8px;border-radius:4px;font-family:monospace;word-break:break-all;display:inline-block;margin-top:4px;">${secret}</code>
+          </p>
+          <p style="font-size:12px;color:#666;margin-top:16px;">
+            This QR code will expire in 10 minutes. If you need a new one, request it again from the MFA setup page.
+          </p>
+          <p>Thanks,<br/>The Howdy Team</p>
+        </div>
+      `;
+      
+      const emailText = `Multi-Factor Authentication Setup for Howdy
+
+To complete setup:
+1. Open your authenticator app (Google Authenticator, Microsoft Authenticator, Authy, or any TOTP-compatible app)
+2. Scan the QR code in this email, or tap the link to add it directly
+3. Enter the 6-digit code from your authenticator app in the Howdy app to verify
+
+Open in Authenticator App: ${otpauth}
+
+Manual entry secret: ${secret}
+
+This QR code will expire in 10 minutes. If you need a new one, request it again from the MFA setup page.
+
+Thanks,
+The Howdy Team`;
+
+      await sendEmail(
+        email,
+        'Set up Multi-Factor Authentication for Howdy',
+        emailText,
+        emailHtml
+      );
+      console.log(`[MFA TOTP BEGIN] Email sent to ${email}`);
+    } catch (emailErr) {
+      console.error('[MFA TOTP BEGIN] Failed to send email:', emailErr);
+      // Continue anyway - user can still use manual entry
+    }
+
+    // Return secret for manual entry as well (but don't show QR in UI)
+    return res.status(200).json({ secret, tx, step, emailSent: true });
   } catch (e) {
     console.error('TOTP begin error:', e);
     return res.status(500).json({ error: 'Failed to start TOTP setup' });
@@ -697,10 +858,18 @@ authRouter.post('/mfa/verify', async (req, res) => {
     }
     if (!ok) return res.status(400).json({ error: 'Invalid code' });
 
-    const accessToken = jwt.sign({ uid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
-    const refreshToken = jwt.sign({ uid, t: 'refresh' }, process.env.JWT_SECRET!, { expiresIn: '180d' });
-    await db.collection('refresh_tokens').doc().set({ uid, token: refreshToken, createdAt: Date.now() });
-    return res.status(200).json({ accessToken, refreshToken });
+    const sid = crypto.randomUUID();
+    const refreshToken = jwt.sign({ uid, t: 'refresh', sid }, process.env.JWT_SECRET!, { expiresIn: '180d' });
+    await db.collection('refresh_tokens').doc().set({ uid, token: refreshToken, sid, createdAt: Date.now() });
+
+    // Track the login (MFA method) and logout others
+    const finalSid = await logLoginEvent(uid, req, `mfa-${method}`, refreshToken, sid);
+    const accessToken = jwt.sign({ uid, sid: finalSid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
+
+    // NEW: Issue Firebase custom token for frontend bridging
+    const firebaseCustomToken = await auth.createCustomToken(uid, { sid: finalSid });
+
+    return res.status(200).json({ accessToken, refreshToken, firebaseCustomToken });
   } catch (e) {
     console.error('MFA verification error:', e);
     return res.status(401).json({ error: 'MFA verification failed' });
@@ -718,7 +887,19 @@ authRouter.post('/refresh', async (req, res) => {
     if (!payload || payload.t !== 'refresh' || !payload.uid) {
       return res.status(401).json({ error: 'Invalid refresh token' });
     }
-    const newAccess = jwt.sign({ uid: payload.uid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
+
+    const doc = snap.docs[0];
+    const sid = doc.data().sid || payload.sid;
+
+    // Optional: double check if this is still the active session in metadata
+    if (sid) {
+      const meta = await db.collection('user_metadata').doc(payload.uid).get();
+      if (meta.exists && meta.data()?.currentSessionId && meta.data()?.currentSessionId !== sid) {
+        return res.status(401).json({ error: 'Session expired' });
+      }
+    }
+
+    const newAccess = jwt.sign({ uid: payload.uid, sid }, process.env.JWT_SECRET!, { expiresIn: '15m' });
     return res.status(200).json({ accessToken: newAccess });
   } catch (e) {
     return res.status(401).json({ error: 'Invalid refresh token' });
