@@ -17,15 +17,28 @@ function addMonths(dt: Date, months: number): Date {
 }
 
 function nextWeeklyStart(base: Date, clock: Date): Date {
-  let projected = new Date(base);
-  while (projected.getTime() < clock.getTime()) {
-    projected = new Date(projected.getTime() + 7 * 24 * 60 * 60 * 1000);
-  }
-  return projected;
+  const baseMs = base.getTime();
+  const clockMs = clock.getTime();
+  if (baseMs >= clockMs) return base;
+
+  const weekMs = 7 * 24 * 60 * 60 * 1000;
+  const diff = clockMs - baseMs;
+  const weeksToSkip = Math.ceil(diff / weekMs);
+  return new Date(baseMs + weeksToSkip * weekMs);
 }
 
 function nextMonthlyStart(base: Date, clock: Date): Date {
   let projected = new Date(base);
+  if (projected.getTime() >= clock.getTime()) return projected;
+
+  // Estimate months to skip to avoid long loops if base is very old
+  const yearsDiff = clock.getFullYear() - projected.getFullYear();
+  const monthsDiff = clock.getMonth() - projected.getMonth() + (yearsDiff * 12);
+  
+  if (monthsDiff > 0) {
+    projected = addMonths(projected, monthsDiff);
+  }
+  
   while (projected.getTime() < clock.getTime()) {
     projected = addMonths(projected, 1);
   }
@@ -59,6 +72,8 @@ availabilityRouter.get('/upcoming', async (req, res) => {
   const now = new Date();
   const horizon = new Date(now.getTime() + horizonDays * 24 * 60 * 60 * 1000);
   try {
+    // Optimization: We could filter by end > now - 24h, but that would require a composite index with orderBy('start').
+    // Instead, we'll fetch and filter in-memory. For most users, this is still fast enough if data isn't redundant.
     const snap = await db
       .collection('schedules')
       .doc(uid)
@@ -68,54 +83,47 @@ availabilityRouter.get('/upcoming', async (req, res) => {
     const items = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
 
     const upcoming: any[] = [];
+    const seenSlots = new Set<string>(); // For deduplication: "type-start-end"
+
     for (const it of items) {
       const start = new Date(Number(it.start));
       const end = new Date(Number(it.end));
       const repeat: RepeatType = (it.repeat as RepeatType) ?? null;
       const typ = (it.type || 'scheduled') as string;
       const durationMs = end.getTime() - start.getTime();
+
+      let slotStart: number;
+      let slotEnd: number;
+
       if (!repeat) {
-        if (end.getTime() > now.getTime()) {
-          upcoming.push({
-            id: it.id,
-            type: typ,
-            repeat: null,
-            start: start.getTime(),
-            end: end.getTime(),
-            inWindow: now >= start && now <= end,
-          });
-        }
-        continue;
-      }
-      if (repeat === 'weekly') {
+        if (end.getTime() < now.getTime()) continue;
+        slotStart = start.getTime();
+        slotEnd = end.getTime();
+      } else if (repeat === 'weekly') {
         const nextStart = nextWeeklyStart(start, now);
-        const nextEnd = new Date(nextStart.getTime() + durationMs);
-        if (nextStart <= horizon) {
-          upcoming.push({
-            id: it.id,
-            type: typ,
-            repeat,
-            start: nextStart.getTime(),
-            end: nextEnd.getTime(),
-            inWindow: now >= nextStart && now <= nextEnd,
-          });
-        }
+        slotStart = nextStart.getTime();
+        slotEnd = nextStart.getTime() + durationMs;
+      } else if (repeat === 'monthly') {
+        const nextStart = nextMonthlyStart(start, now);
+        slotStart = nextStart.getTime();
+        slotEnd = nextStart.getTime() + durationMs;
+      } else {
         continue;
       }
-      if (repeat === 'monthly') {
-        const nextStart = nextMonthlyStart(start, now);
-        const nextEnd = new Date(nextStart.getTime() + durationMs);
-        if (nextStart <= horizon) {
+
+      if (slotStart <= horizon.getTime()) {
+        const key = `${typ}-${slotStart}-${slotEnd}`;
+        if (!seenSlots.has(key)) {
           upcoming.push({
             id: it.id,
             type: typ,
             repeat,
-            start: nextStart.getTime(),
-            end: nextEnd.getTime(),
-            inWindow: now >= nextStart && now <= nextEnd,
+            start: slotStart,
+            end: slotEnd,
+            inWindow: now.getTime() >= slotStart && now.getTime() <= slotEnd,
           });
+          seenSlots.add(key);
         }
-        continue;
       }
     }
     upcoming.sort((a, b) => a.start - b.start);
@@ -151,23 +159,32 @@ availabilityRouter.post('/', async (req, res) => {
       const cursor = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate(), 0, 0, 0, 0);
       const endDay = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate(), 0, 0, 0, 0);
       const created: string[] = [];
+      const daysCreated = new Set<number>(); // Track which days of the week we've already created an entry for
+
       while (cursor.getTime() <= endDay.getTime()) {
-        const s = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), new Date(Number(start)).getHours(), new Date(Number(start)).getMinutes(), 0, 0);
-        const e = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), new Date(Number(end)).getHours(), new Date(Number(end)).getMinutes(), 0, 0);
-        const ref = await db
-          .collection('schedules')
-          .doc(uid)
-          .collection('availability')
-          .add({
-            start: s.getTime(),
-            end: e.getTime(),
-            type: typ,
-            repeat: 'weekly',
-            createdBy: uid,
-            createdAt: Date.now(),
-            targetUserId: targetUserId ?? null,
-          });
-        created.push(ref.id);
+        const dayOfWeek = cursor.getDay();
+        if (!daysCreated.has(dayOfWeek)) {
+          const s = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), new Date(Number(start)).getHours(), new Date(Number(start)).getMinutes(), 0, 0);
+          const e = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), new Date(Number(end)).getHours(), new Date(Number(end)).getMinutes(), 0, 0);
+          const ref = await db
+            .collection('schedules')
+            .doc(uid)
+            .collection('availability')
+            .add({
+              start: s.getTime(),
+              end: e.getTime(),
+              type: typ,
+              repeat: 'weekly',
+              createdBy: uid,
+              createdAt: Date.now(),
+              targetUserId: targetUserId ?? null,
+            });
+          created.push(ref.id);
+          daysCreated.add(dayOfWeek);
+          
+          // Optimization: If we've covered all 7 days of the week, we can stop
+          if (daysCreated.size === 7) break;
+        }
         cursor.setDate(cursor.getDate() + 1);
       }
       return res.status(200).json({ ok: true, created });

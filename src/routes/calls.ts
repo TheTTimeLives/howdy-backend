@@ -338,6 +338,54 @@ callsRouter.get('/active', async (req, res) => {
   }
 });
 
+// List recent ended calls for the current user
+// GET /calls/history/me?limit=50
+callsRouter.get('/history/me', async (req, res) => {
+  try {
+    const uid = (req as any).uid;
+    const limitRaw = Number(req.query.limit ?? 50);
+    const limit = isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : 50;
+
+    // Fetch calls where user was a participant
+    // Note: Our calls collection has a 'participants' array field
+    const callsSnap = await db
+      .collection('calls')
+      .where('participants', 'array-contains', uid)
+      .where('active', '==', false)
+      .orderBy('endedAt', 'desc')
+      .limit(limit)
+      .get();
+
+    const rows: any[] = [];
+    for (const doc of callsSnap.docs) {
+      const data = doc.data() || {};
+      const participants: string[] = Array.from(new Set(data.participants || []));
+      const partnerUid = participants.find(p => p !== uid) || '';
+      
+      let partnerUsername = partnerUid;
+      if (partnerUid) {
+        const meta = await db.collection('user_metadata').doc(partnerUid).get();
+        partnerUsername = meta.data()?.username || partnerUid;
+      }
+
+      rows.push({
+        channelName: data.channelName,
+        partnerUid,
+        partnerUsername,
+        startedAt: data.startedAt,
+        endedAt: data.endedAt,
+        durationSec: data.startedAt && data.endedAt ? Math.round((data.endedAt - data.startedAt) / 1000) : 0,
+        transcription: data.transcription || null,
+      });
+    }
+
+    return res.json({ calls: rows });
+  } catch (e) {
+    console.error('❌ /calls/history/me error', e);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+});
+
 // List recent ended calls that included a member of the specified group
 // GET /calls/history?groupId=abc123&limit=100
 callsRouter.get('/history', async (req, res) => {

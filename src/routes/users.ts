@@ -118,6 +118,9 @@ usersRouter.get('/me', async (req, res) => {
       // Expose decrypted names if present; otherwise null
       firstName,
       lastName,
+      matchingIntent: metadata?.matchingIntent ?? null,
+      gender: metadata?.gender ?? null,
+      genderInterest: metadata?.genderInterest ?? null,
     });
   } catch (e) {
     console.error('❌ Fetch error:', e);

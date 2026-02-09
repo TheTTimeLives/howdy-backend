@@ -2,6 +2,7 @@ import express from 'express';
 import { db, auth } from '../firebase';
 import admin from 'firebase-admin';
 import { verifyJwt } from '../verifyJwt';
+import { logLoginEvent } from './auth';
 import crypto from 'crypto';
 
 export const devicesRouter = express.Router();
@@ -241,8 +242,12 @@ devicesPublicRouter.post('/login/prove', async (req, res) => {
 
     await idxRef.set({ loginChallenge: { ...lc, usedAt: Date.now() }, lastSeenAt: Date.now() }, { merge: true });
 
-    // Issue Firebase custom token for this member
-    const customToken = await auth.createCustomToken(idx.uid, { deviceId });
+    // Track the device login and invalidate others
+    const sid = crypto.randomUUID();
+    const finalSid = await logLoginEvent(idx.uid, req, 'device-login', undefined, sid);
+
+    // Issue Firebase custom token for this member with session ID
+    const customToken = await auth.createCustomToken(idx.uid, { deviceId, sid: finalSid });
     return res.status(200).json({ customToken });
   } catch (e) {
     console.error('❌ /devices/login/prove failed', e);
