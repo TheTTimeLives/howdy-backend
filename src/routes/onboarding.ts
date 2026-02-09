@@ -326,7 +326,7 @@ onboardingRouter.post('/', async (req, res) => {
       (req as any).user?.uid || (req as any).userId || (req as any).uid;
     if (!requesterUid) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { bioResponses, interests, username, photoUrl, advanceTo, memberId, clearBio, matchingIntent } =
+    const { bioResponses, interests, username, photoUrl, advanceTo, memberId, clearBio, matchingIntent, gender, genderInterest } =
       (req.body ?? {}) as {
         bioResponses?: Record<string, unknown>;
         interests?: unknown[];
@@ -336,6 +336,8 @@ onboardingRouter.post('/', async (req, res) => {
         memberId?: string;
         clearBio?: boolean;
         matchingIntent?: 'friends' | 'romance' | 'both';
+        gender?: string;
+        genderInterest?: string;
       };
 
     // Debug log: request summary (no PII)
@@ -397,6 +399,12 @@ onboardingRouter.post('/', async (req, res) => {
     }
     if (matchingIntent && ['friends', 'romance', 'both'].includes(matchingIntent)) {
       metaUpdates['matchingIntent'] = matchingIntent;
+    }
+    if (typeof gender === 'string' && gender.trim()) {
+      metaUpdates['gender'] = gender.trim();
+    }
+    if (typeof genderInterest === 'string' && genderInterest.trim()) {
+      metaUpdates['genderInterest'] = genderInterest.trim();
     }
 
     const userRef = db.collection('users').doc(targetUid);

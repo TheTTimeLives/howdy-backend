@@ -459,7 +459,6 @@ authRouter.post('/login', async (req, res) => {
   try {
     const snapshot = await db.collection('users').where('email', '==', email).get();
     if (snapshot.empty) {
-      console.log('❌ No user found for email:', email);
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
@@ -486,7 +485,29 @@ authRouter.post('/login', async (req, res) => {
 
     if (mfaRequired) {
       const mfaToken = jwt.sign({ uid: userDoc.id, t: 'mfa' }, process.env.JWT_SECRET!, { expiresIn: '5m' });
-      return res.status(200).json({ mfaRequired: true, methods: mfa.methods, mfaToken });
+      
+      // Include backup emails (without revealing full addresses for security)
+      const backupEmails = Array.isArray(mfa.backupEmails) ? mfa.backupEmails : [];
+      const backupEmailOptions = backupEmails
+        .filter((e: any) => e.verified === true)
+        .map((e: any) => {
+          const email = e.email;
+          // Mask email for privacy: abc@example.com -> a**@example.com
+          const [local, domain] = email.split('@');
+          const maskedLocal = local.length > 2 ? local[0] + '**' + local[local.length - 1] : local[0] + '**';
+          return {
+            masked: `${maskedLocal}@${domain}`,
+            full: email  // Include full for verification, frontend will store it
+          };
+        });
+      
+      return res.status(200).json({ 
+        mfaRequired: true, 
+        methods: mfa.methods, 
+        backupEmails: backupEmailOptions,
+        hasTotp: mfa.methods.includes('totp'),
+        mfaToken 
+      });
     }
 
     const sid = crypto.randomUUID();
@@ -769,19 +790,218 @@ authRouter.post('/mfa/setup/totp/verify', verifyJwt, async (req, res) => {
     );
 
     await tmpRef.delete();
-    console.log(`[MFA TOTP VERIFY] uid=${uid} tx=${tx || 'n/a'} status=ENABLED methods=${JSON.stringify(methods)}`);
-    return res.status(200).json({ ok: true });
+    
+    // Check if MFA can be fully enabled (TOTP + at least 1 backup email verified)
+    const hasVerifiedBackupEmail = Array.isArray(prevMfa.backupEmails) && 
+      prevMfa.backupEmails.some((e: any) => e.verified === true);
+    
+    console.log(`[MFA TOTP VERIFY] uid=${uid} tx=${tx || 'n/a'} totpVerified=true backupEmailVerified=${hasVerifiedBackupEmail} methods=${JSON.stringify(methods)}`);
+    
+    return res.status(200).json({ 
+      ok: true, 
+      mfaFullyEnabled: hasVerifiedBackupEmail,
+      message: hasVerifiedBackupEmail ? 'MFA fully enabled' : 'Please add and verify at least one backup email'
+    });
   } catch (e) {
     console.error('TOTP verify error:', e);
     return res.status(500).json({ error: 'Failed to verify TOTP' });
   }
 });
 
-// --------- MFA: CHALLENGE (email only for now) ---------
+// --------- MFA: BACKUP EMAIL SETUP ---------
+authRouter.post('/mfa/setup/backup-email/add', verifyJwt, async (req, res) => {
+  const uid = (req as any).uid as string;
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Invalid email address' });
+  }
+  
+  try {
+    const userDoc = await db.collection('users').doc(uid).get();
+    const primaryEmail = userDoc.data()?.email?.toLowerCase();
+    
+    // Prevent using primary email as backup
+    if (email === primaryEmail) {
+      return res.status(400).json({ error: 'Cannot use primary email as backup email' });
+    }
+    
+    const metaRef = db.collection('user_metadata').doc(uid);
+    const metaSnap = await metaRef.get();
+    const mfa = (metaSnap.data()?.mfa || {}) as any;
+    const backupEmails = Array.isArray(mfa.backupEmails) ? mfa.backupEmails : [];
+    
+    // Check if email already exists
+    if (backupEmails.some((e: any) => e.email === email)) {
+      return res.status(400).json({ error: 'Email already added' });
+    }
+    
+    // Max 3 backup emails
+    if (backupEmails.length >= 3) {
+      return res.status(400).json({ error: 'Maximum 3 backup emails allowed' });
+    }
+    
+    // Generate verification code
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const codeRef = db.collection('mfa_backup_email_codes').doc(`${uid}_${email}`);
+    await codeRef.set({ code, email, createdAt: Date.now() });
+    
+    // Send verification email
+    await sendEmail(
+      email,
+      'Verify your Howdy backup email',
+      `Your verification code is: ${code}\n\nThis code will expire in 10 minutes.`,
+      `<div style="font-family: Arial, sans-serif; padding: 20px;">
+        <h2>Verify Your Backup Email</h2>
+        <p>You're adding this email as a backup for multi-factor authentication on your Howdy account.</p>
+        <div style="background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
+          <p style="margin: 0; font-size: 14px; color: #666;">Your verification code:</p>
+          <p style="margin: 10px 0 0 0; font-size: 32px; font-weight: bold; letter-spacing: 5px;">${code}</p>
+        </div>
+        <p style="color: #666; font-size: 14px;">This code will expire in 10 minutes.</p>
+        <p style="color: #666; font-size: 14px;">If you didn't request this, please ignore this email.</p>
+      </div>`
+    );
+    
+    console.log(`[MFA BACKUP EMAIL] uid=${uid} sent verification to ${email}`);
+    
+    return res.status(200).json({ ok: true, message: 'Verification code sent' });
+  } catch (e) {
+    console.error('Backup email add error:', e);
+    return res.status(500).json({ error: 'Failed to send verification code' });
+  }
+});
+
+authRouter.post('/mfa/setup/backup-email/verify', verifyJwt, async (req, res) => {
+  const uid = (req as any).uid as string;
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const code = String(req.body?.code || '').replace(/\s+/g, '');
+  
+  if (!email || !code) {
+    return res.status(400).json({ error: 'Missing email or code' });
+  }
+  
+  try {
+    const codeRef = db.collection('mfa_backup_email_codes').doc(`${uid}_${email}`);
+    const codeDoc = await codeRef.get();
+    
+    if (!codeDoc.exists) {
+      return res.status(400).json({ error: 'No verification in progress for this email' });
+    }
+    
+    const { code: storedCode, createdAt } = codeDoc.data() as any;
+    const ageMs = Date.now() - (createdAt || 0);
+    
+    // 10 minute expiry
+    if (ageMs > 10 * 60 * 1000) {
+      await codeRef.delete();
+      return res.status(400).json({ error: 'Verification code expired' });
+    }
+    
+    if (storedCode !== code) {
+      return res.status(400).json({ error: 'Invalid verification code' });
+    }
+    
+    // Add to user_metadata.mfa.backupEmails
+    const metaRef = db.collection('user_metadata').doc(uid);
+    const metaSnap = await metaRef.get();
+    const mfa = (metaSnap.data()?.mfa || {}) as any;
+    const backupEmails = Array.isArray(mfa.backupEmails) ? mfa.backupEmails : [];
+    
+    // Add new verified email
+    backupEmails.push({
+      email,
+      verified: true,
+      addedAt: Date.now()
+    });
+    
+    // Check if MFA can now be fully enabled (TOTP + at least 1 backup email)
+    const hasTotpSecret = typeof mfa.totpSecretEnc === 'string' && mfa.totpSecretEnc.length > 0;
+    const canEnableMfa = hasTotpSecret && backupEmails.length > 0;
+    
+    await metaRef.set(
+      {
+        mfa: {
+          ...mfa,
+          backupEmails,
+          required: canEnableMfa,  // Enable MFA if TOTP + at least 1 backup email
+          methods: canEnableMfa ? Array.from(new Set([...(mfa.methods || []), 'totp', 'email'])) : (mfa.methods || []),
+        },
+      },
+      { merge: true }
+    );
+    
+    // Clean up verification code
+    await codeRef.delete();
+    
+    console.log(`[MFA BACKUP EMAIL VERIFY] uid=${uid} email=${email} verified=true mfaEnabled=${canEnableMfa}`);
+    
+    return res.status(200).json({ 
+      ok: true, 
+      mfaFullyEnabled: canEnableMfa,
+      backupEmailsCount: backupEmails.length,
+      message: canEnableMfa ? 'MFA fully enabled!' : 'Backup email verified. Please complete TOTP setup.'
+    });
+  } catch (e) {
+    console.error('Backup email verify error:', e);
+    return res.status(500).json({ error: 'Failed to verify backup email' });
+  }
+});
+
+authRouter.post('/mfa/setup/backup-email/remove', verifyJwt, async (req, res) => {
+  const uid = (req as any).uid as string;
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  
+  if (!email) {
+    return res.status(400).json({ error: 'Missing email' });
+  }
+  
+  try {
+    const metaRef = db.collection('user_metadata').doc(uid);
+    const metaSnap = await metaRef.get();
+    const mfa = (metaSnap.data()?.mfa || {}) as any;
+    const backupEmails = Array.isArray(mfa.backupEmails) ? mfa.backupEmails : [];
+    
+    const updatedEmails = backupEmails.filter((e: any) => e.email !== email);
+    
+    if (updatedEmails.length === backupEmails.length) {
+      return res.status(404).json({ error: 'Email not found' });
+    }
+    
+    // If removing the last backup email, disable MFA
+    const shouldDisableMfa = updatedEmails.length === 0 && mfa.required === true;
+    
+    await metaRef.set(
+      {
+        mfa: {
+          ...mfa,
+          backupEmails: updatedEmails,
+          required: shouldDisableMfa ? false : mfa.required,
+        },
+      },
+      { merge: true }
+    );
+    
+    console.log(`[MFA BACKUP EMAIL REMOVE] uid=${uid} email=${email} remaining=${updatedEmails.length} mfaDisabled=${shouldDisableMfa}`);
+    
+    return res.status(200).json({ 
+      ok: true, 
+      backupEmailsCount: updatedEmails.length,
+      mfaDisabled: shouldDisableMfa
+    });
+  } catch (e) {
+    console.error('Backup email remove error:', e);
+    return res.status(500).json({ error: 'Failed to remove backup email' });
+  }
+});
+
+// --------- MFA: CHALLENGE (TOTP or backup email at login) ---------
 authRouter.post('/mfa/challenge', async (req, res) => {
   let uid: string | null = (req as any).uid || null;
   const method = String(req.body?.method || '');
+  const emailTarget = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
   const mfaToken = req.body?.mfaToken ? String(req.body.mfaToken) : '';
+  
   if (!uid && mfaToken) {
     try {
       const payload = jwt.verify(mfaToken, process.env.JWT_SECRET!) as any;
@@ -792,23 +1012,61 @@ authRouter.post('/mfa/challenge', async (req, res) => {
   if (!['email'].includes(method)) return res.status(400).json({ error: 'Unsupported method' });
 
   try {
+    // Get user's backup emails
+    const meta = await db.collection('user_metadata').doc(uid).get();
+    const mfa = (meta.data()?.mfa || {}) as any;
+    const backupEmails = Array.isArray(mfa.backupEmails) ? mfa.backupEmails : [];
+    
+    // Determine which email to send to
+    let targetEmail: string | null = null;
+    
+    if (emailTarget) {
+      // User specified which backup email to use
+      const found = backupEmails.find((e: any) => e.email === emailTarget && e.verified === true);
+      if (found) {
+        targetEmail = found.email;
+      } else {
+        return res.status(400).json({ error: 'Invalid or unverified backup email' });
+      }
+    } else {
+      // Use first verified backup email
+      const firstVerified = backupEmails.find((e: any) => e.verified === true);
+      if (firstVerified) {
+        targetEmail = firstVerified.email;
+      }
+    }
+    
+    if (!targetEmail) {
+      return res.status(400).json({ error: 'No verified backup email available' });
+    }
+    
+    // Generate and store code
     const code = Math.floor(100000 + Math.random() * 900000).toString();
-    await db.collection('mfa_email_codes').doc(uid).set(
-      { code, createdAt: Date.now() },
+    await db.collection('mfa_email_codes').doc(`${uid}_${targetEmail}`).set(
+      { code, email: targetEmail, createdAt: Date.now() },
       { merge: true }
     );
-    const user = await db.collection('users').doc(uid).get();
-    const email = user.data()?.email;
-    console.log(`[MFA EMAIL CHALLENGE] uid=${uid} sent=${!!email}`);
-    if (email) {
-      await sendEmail(
-        email,
-        'Your Howdy login code',
-        `Your code is: ${code}`,
-        `<p>Your code: <strong>${code}</strong></p>`
-      );
-    }
-    return res.status(200).json({ ok: true });
+    
+    // Send code to backup email
+    await sendEmail(
+      targetEmail,
+      'Your Howdy login code',
+      `Your login code is: ${code}\n\nThis code will expire in 5 minutes.`,
+      `<div style="font-family: Arial, sans-serif; padding: 20px;">
+        <h2>Your Login Code</h2>
+        <p>Someone is trying to log into your Howdy account.</p>
+        <div style="background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0;">
+          <p style="margin: 0; font-size: 14px; color: #666;">Your login code:</p>
+          <p style="margin: 10px 0 0 0; font-size: 32px; font-weight: bold; letter-spacing: 5px;">${code}</p>
+        </div>
+        <p style="color: #666; font-size: 14px;">This code will expire in 5 minutes.</p>
+        <p style="color: #666; font-size: 14px;">If this wasn't you, please secure your account immediately.</p>
+      </div>`
+    );
+    
+    console.log(`[MFA EMAIL CHALLENGE] uid=${uid} sentTo=${targetEmail}`);
+    
+    return res.status(200).json({ ok: true, sentTo: targetEmail });
   } catch (e) {
     console.error('MFA challenge error:', e);
     return res.status(500).json({ error: 'Failed to send code' });
@@ -849,12 +1107,41 @@ authRouter.post('/mfa/verify', async (req, res) => {
         + `secretFp=${fp(mfa.totpSecretEnc)} window=${TOTP_WINDOW_STEPS} step=${step} timeRemaining=${timeRemaining} ok=${ok}`
       );
     } else if (method === 'email') {
-      const doc = await db.collection('mfa_email_codes').doc(uid).get();
-      if (doc.exists) {
-        const { code: stored, createdAt } = (doc.data() || {}) as any;
-        ok = stored === code && Date.now() - (createdAt || 0) < 5 * 60_000;
+      // Check code against all backup emails
+      const emailTarget = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
+      const backupEmails = Array.isArray(mfa.backupEmails) ? mfa.backupEmails : [];
+      
+      let checkedEmail: string | null = null;
+      
+      if (emailTarget) {
+        // User specified which email they used
+        const found = backupEmails.find((e: any) => e.email === emailTarget && e.verified === true);
+        if (found) {
+          checkedEmail = found.email;
+        }
+      } else {
+        // Check all verified backup emails
+        for (const e of backupEmails) {
+          if (e.verified === true) {
+            checkedEmail = e.email;
+            break;
+          }
+        }
       }
-      console.log(`[MFA VERIFY] method=email uid=${uid} ok=${ok}`);
+      
+      if (checkedEmail) {
+        const doc = await db.collection('mfa_email_codes').doc(`${uid}_${checkedEmail}`).get();
+        if (doc.exists) {
+          const { code: stored, createdAt } = (doc.data() || {}) as any;
+          ok = stored === code && Date.now() - (createdAt || 0) < 5 * 60_000;
+          if (ok) {
+            // Clean up used code
+            await doc.ref.delete();
+          }
+        }
+      }
+      
+      console.log(`[MFA VERIFY] method=email uid=${uid} email=${checkedEmail} ok=${ok}`);
     }
     if (!ok) return res.status(400).json({ error: 'Invalid code' });
 
@@ -873,6 +1160,128 @@ authRouter.post('/mfa/verify', async (req, res) => {
   } catch (e) {
     console.error('MFA verification error:', e);
     return res.status(401).json({ error: 'MFA verification failed' });
+  }
+});
+
+// --------- MFA: GET STATUS ---------
+authRouter.get('/mfa/status', verifyJwt, async (req, res) => {
+  const uid = (req as any).uid as string;
+  
+  try {
+    const meta = await db.collection('user_metadata').doc(uid).get();
+    const mfa = (meta.data()?.mfa || {}) as any;
+    
+    const hasTotpSecret = typeof mfa.totpSecretEnc === 'string' && mfa.totpSecretEnc.length > 0;
+    const backupEmails = Array.isArray(mfa.backupEmails) ? mfa.backupEmails : [];
+    const verifiedBackupEmails = backupEmails.filter((e: any) => e.verified === true);
+    
+    return res.status(200).json({
+      enabled: mfa.required === true,
+      methods: mfa.methods || [],
+      hasTotpConfigured: hasTotpSecret,
+      backupEmails: verifiedBackupEmails.map((e: any) => ({
+        email: e.email,
+        addedAt: e.addedAt
+      })),
+      canEnableMfa: hasTotpSecret && verifiedBackupEmails.length > 0
+    });
+  } catch (e) {
+    console.error('MFA status error:', e);
+    return res.status(500).json({ error: 'Failed to get MFA status' });
+  }
+});
+
+// --------- MFA: RECOVERY REQUEST ---------
+authRouter.post('/mfa/recovery', async (req, res) => {
+  const primaryEmail = String(req.body?.primaryEmail || '').trim().toLowerCase();
+  const contactEmail = String(req.body?.contactEmail || '').trim().toLowerCase();
+  const reason = String(req.body?.reason || '').trim();
+  
+  if (!primaryEmail || !contactEmail) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(primaryEmail) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) {
+    return res.status(400).json({ error: 'Invalid email address' });
+  }
+  
+  try {
+    // Check if user exists
+    const userSnap = await db.collection('users').where('email', '==', primaryEmail).get();
+    
+    if (userSnap.empty) {
+      // Don't reveal if user exists or not for security
+      return res.status(200).json({ ok: true, message: 'Recovery request submitted' });
+    }
+    
+    const userId = userSnap.docs[0].id;
+    
+    // Log the recovery request
+    await db.collection('mfa_recovery_requests').add({
+      userId,
+      primaryEmail,
+      contactEmail,
+      reason: reason || 'User cannot access MFA methods',
+      submittedAt: Date.now(),
+      status: 'pending',
+      ip: (req.headers['x-forwarded-for'] as string || req.socket.remoteAddress || 'unknown').split(',')[0].trim(),
+      userAgent: req.headers['user-agent'] || 'unknown'
+    });
+    
+    // Send email to support
+    const supportEmail = process.env.SUPPORT_EMAIL || 'support@howdy.app';
+    
+    await sendEmail(
+      supportEmail,
+      `MFA Recovery Request - ${primaryEmail}`,
+      `A user has requested MFA recovery assistance.\n\n` +
+      `Primary Account Email: ${primaryEmail}\n` +
+      `Contact Email: ${contactEmail}\n` +
+      `Reason: ${reason || 'Not specified'}\n\n` +
+      `Please reach out to the user at the contact email provided.`,
+      `<div style="font-family: Arial, sans-serif; padding: 20px;">
+        <h2>MFA Recovery Request</h2>
+        <p>A user has requested MFA recovery assistance.</p>
+        <table style="border-collapse: collapse; margin: 20px 0;">
+          <tr>
+            <td style="padding: 8px; font-weight: bold; border-bottom: 1px solid #ddd;">Primary Account Email:</td>
+            <td style="padding: 8px; border-bottom: 1px solid #ddd;">${primaryEmail}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; font-weight: bold; border-bottom: 1px solid #ddd;">Contact Email:</td>
+            <td style="padding: 8px; border-bottom: 1px solid #ddd;">${contactEmail}</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px; font-weight: bold; border-bottom: 1px solid #ddd;">Reason:</td>
+            <td style="padding: 8px; border-bottom: 1px solid #ddd;">${reason || 'Not specified'}</td>
+          </tr>
+        </table>
+        <p style="color: #666;">Please reach out to the user at the contact email provided.</p>
+      </div>`
+    );
+    
+    // Send confirmation to user
+    await sendEmail(
+      contactEmail,
+      'Howdy MFA Recovery Request Received',
+      `We've received your request for MFA recovery assistance.\n\n` +
+      `Our support team will reach out to you at this email address within 24-48 hours.\n\n` +
+      `Thank you for your patience.`,
+      `<div style="font-family: Arial, sans-serif; padding: 20px;">
+        <h2>Recovery Request Received</h2>
+        <p>We've received your request for MFA recovery assistance for the account:</p>
+        <p style="font-weight: bold;">${primaryEmail}</p>
+        <p>Our support team will reach out to you at this email address within 24-48 hours.</p>
+        <p style="color: #666; font-size: 14px; margin-top: 30px;">Thank you for your patience.</p>
+      </div>`
+    );
+    
+    console.log(`[MFA RECOVERY] primaryEmail=${primaryEmail} contactEmail=${contactEmail}`);
+    
+    return res.status(200).json({ ok: true, message: 'Recovery request submitted successfully' });
+  } catch (e) {
+    console.error('MFA recovery error:', e);
+    return res.status(500).json({ error: 'Failed to submit recovery request' });
   }
 });
 
