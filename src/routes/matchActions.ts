@@ -101,23 +101,48 @@ matchActionsRouter.post('/decline', async (req, res) => {
 
   const partnerId = data.partnerId;
   const partnerRef = db.collection('matchQueue').doc(partnerId);
+  const partnerDoc = await partnerRef.get();
+  const partnerData = partnerDoc.data();
 
-  await Promise.all([
-    docRef.update({
-      state: 'searching',
-      partnerId: null,
-      channelName: null,
-      accepted: false,
-    }),
-    partnerRef.update({
-      state: 'searching',
-      partnerId: null,
-      channelName: null,
-      accepted: false,
-    }),
-  ]);
+  // Get partner's match wait timeout (default 30 seconds)
+  const partnerMetaDoc = await db.collection('user_metadata').doc(partnerId).get();
+  const matchWaitTimeoutMs = (partnerMetaDoc.data()?.matchWaitTimeoutSeconds ?? 30) * 1000;
 
   const now = Date.now();
+
+  // Check if partner already accepted
+  const partnerAccepted = partnerData?.accepted === true || partnerData?.state === 'match-accepted-pending';
+
+  if (partnerAccepted) {
+    // Partner accepted, this user declined
+    // Put partner in "waiting-for-rematch" state for configurable duration
+    await partnerRef.update({
+      state: 'waiting-for-rematch',
+      partnerId: null,
+      channelName: null,
+      accepted: false,
+      rematchDeadline: now + matchWaitTimeoutMs,
+      declinedBy: uid, // Track who declined
+    });
+    console.log(`⏳ ${partnerId} waiting for rematch (${matchWaitTimeoutMs}ms) after ${uid} declined`);
+  } else {
+    // Neither accepted yet, or both declined simultaneously
+    await partnerRef.update({
+      state: 'searching',
+      partnerId: null,
+      channelName: null,
+      accepted: false,
+    });
+  }
+
+  // Declining user goes back to searching
+  await docRef.update({
+    state: 'searching',
+    partnerId: null,
+    channelName: null,
+    accepted: false,
+  });
+
   const userMetadataRef = db
     .collection('users')
     .doc(uid)

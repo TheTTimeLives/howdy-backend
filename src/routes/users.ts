@@ -225,6 +225,36 @@ try {
 
 });
 
+// POST /users/timer-settings { matchWaitTimeoutSeconds, reconnectionGracePeriodSeconds }
+usersRouter.post('/timer-settings', async (req, res) => {
+  const uid = (req as any).uid;
+  const { matchWaitTimeoutSeconds, reconnectionGracePeriodSeconds } = req.body;
+
+  try {
+    const updatePayload: any = {};
+    
+    if (typeof matchWaitTimeoutSeconds === 'number' && matchWaitTimeoutSeconds >= 10 && matchWaitTimeoutSeconds <= 120) {
+      updatePayload.matchWaitTimeoutSeconds = matchWaitTimeoutSeconds;
+    }
+    
+    if (typeof reconnectionGracePeriodSeconds === 'number' && reconnectionGracePeriodSeconds >= 10 && reconnectionGracePeriodSeconds <= 300) {
+      updatePayload.reconnectionGracePeriodSeconds = reconnectionGracePeriodSeconds;
+    }
+
+    if (Object.keys(updatePayload).length === 0) {
+      return res.status(400).json({ error: 'No valid timer settings provided' });
+    }
+
+    await db.collection('user_metadata').doc(uid).set(updatePayload, { merge: true });
+    
+    console.log(`⏱️ Updated timer settings for ${uid}:`, updatePayload);
+    return res.status(200).json({ ok: true, ...updatePayload });
+  } catch (e) {
+    console.error('❌ Failed to update timer settings:', e);
+    return res.status(500).json({ error: 'Failed to update timer settings' });
+  }
+});
+
 // POST /users/device-status  { platform, policyAccessGranted, interruptionFilter, ringerMode, reportedAt }
 usersRouter.post('/device-status', async (req, res) => {
   const uid = (req as any).uid as string;

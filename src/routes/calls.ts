@@ -281,6 +281,77 @@ callsRouter.post('/start', async (req, res) => {
   }
 });
 
+// Track participant disconnect
+// POST /calls/:channelName/disconnect
+callsRouter.post('/:channelName/disconnect', async (req, res) => {
+  try {
+    const { channelName } = req.params;
+    const uid = (req as any).uid as string;
+    
+    const ref = channelDocRef(channelName);
+    const snap = await ref.get();
+    
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+
+    // Get user's reconnection grace period setting (default 60 seconds)
+    const userMetaDoc = await db.collection('user_metadata').doc(uid).get();
+    const reconnectionGracePeriodMs = (userMetaDoc.data()?.reconnectionGracePeriodSeconds ?? 60) * 1000;
+
+    const now = Date.now();
+    await ref.set({
+      disconnections: {
+        [uid]: {
+          disconnectedAt: now,
+          reconnectionDeadline: now + reconnectionGracePeriodMs,
+        }
+      }
+    }, { merge: true });
+
+    console.log(`🔌 ${uid} disconnected from ${channelName}, grace period: ${reconnectionGracePeriodMs}ms`);
+    return res.status(200).json({ 
+      ok: true, 
+      reconnectionGracePeriodSeconds: reconnectionGracePeriodMs / 1000 
+    });
+  } catch (e) {
+    console.error('❌ /calls/:channelName/disconnect error', e);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+});
+
+// Track participant reconnect
+// POST /calls/:channelName/reconnect
+callsRouter.post('/:channelName/reconnect', async (req, res) => {
+  try {
+    const { channelName } = req.params;
+    const uid = (req as any).uid as string;
+    
+    const ref = channelDocRef(channelName);
+    const snap = await ref.get();
+    
+    if (!snap.exists) {
+      return res.status(404).json({ error: 'Call not found' });
+    }
+
+    // Clear disconnection for this user
+    const data = snap.data() || {};
+    const disconnections = data.disconnections || {};
+    delete disconnections[uid];
+
+    await ref.set({
+      disconnections,
+      lastSeenAt: Date.now(),
+    }, { merge: true });
+
+    console.log(`✅ ${uid} reconnected to ${channelName}`);
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('❌ /calls/:channelName/reconnect error', e);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+});
+
 // List active calls that include any member of the specified group
 // GET /calls/active?groupId=abc123
 callsRouter.get('/active', async (req, res) => {

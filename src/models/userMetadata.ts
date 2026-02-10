@@ -30,6 +30,9 @@ export const UserMetadataDocSchema = z.object({
   chiLevel: z.number().nullable().optional(),
   chiDailyKey: z.string().nullable().optional(),
   chiDailyCount: z.number().nullable().optional(),
+  // Timer settings for matching and calls
+  matchWaitTimeoutSeconds: z.number().nullable().optional(), // Default 30s
+  reconnectionGracePeriodSeconds: z.number().nullable().optional(), // Default 60s
 });
 
 export type UserMetadataDoc = z.infer<typeof UserMetadataDocSchema>;

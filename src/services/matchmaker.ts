@@ -63,13 +63,143 @@ function calculateMatchType(
 
 export const matchUsers = async () => {
   const queueRef = db.collection('matchQueue');
+  
+  // First, handle users in "waiting-for-rematch" state
+  // Check for expired rematch windows
+  const now = Date.now();
+  const rematchingSnapshot = await queueRef
+    .where('state', '==', 'waiting-for-rematch')
+    .get();
+
+  for (const doc of rematchingSnapshot.docs) {
+    const data = doc.data();
+    if (data.rematchDeadline && data.rematchDeadline < now) {
+      // Timeout expired, transition to "rematch-timeout"
+      await queueRef.doc(doc.id).update({
+        state: 'rematch-timeout',
+        timestamp: now,
+      });
+      console.log(`⏰ ${doc.id} rematch window expired, showing timeout message`);
+    }
+  }
+
+  // Fetch all users in "waiting-for-rematch" (not expired)
+  const rematchingUsersSnapshot = await queueRef
+    .where('state', '==', 'waiting-for-rematch')
+    .orderBy('timestamp')
+    .get();
+
+  // Fetch all users actively searching
   const waitingSnapshot = await queueRef
     .where('state', '==', 'searching')
     .orderBy('timestamp')
     .get();
 
+  const rematchingUsers = rematchingUsersSnapshot.docs;
   const users = waitingSnapshot.docs;
 
+  // Try to match "waiting-for-rematch" users first (they have priority)
+  for (const rematchUser of rematchingUsers) {
+    const rematchUid = rematchUser.id;
+    const rematchData = rematchUser.data();
+
+    // Skip if deadline expired (should have been caught above, but double-check)
+    if (rematchData.rematchDeadline && rematchData.rematchDeadline < now) {
+      continue;
+    }
+
+    // Fetch rematch user's preferences
+    const rematchPrefsSnap = await db
+      .collection('users')
+      .doc(rematchUid)
+      .collection('user-metadata')
+      .doc('user-metadata')
+      .get();
+    const rematchPrefs = rematchPrefsSnap.exists ? rematchPrefsSnap.data() : {};
+
+    const rematchMetadataSnap = await db
+      .collection('users')
+      .doc(rematchUid)
+      .collection('user-metadata')
+      .doc('matches')
+      .get();
+    const rematchPreviouslyMatched = rematchMetadataSnap.exists
+      ? rematchMetadataSnap.data() ?? {}
+      : {};
+
+    // Try to match with searching users
+    for (const searchingUser of users) {
+      const candidateId = searchingUser.id;
+      const candidateData = searchingUser.data();
+
+      // Skip if previously declined
+      if (rematchPreviouslyMatched[candidateId]?.declined) continue;
+
+      // Fetch candidate's preferences
+      const candidatePrefsSnap = await db
+        .collection('users')
+        .doc(candidateId)
+        .collection('user-metadata')
+        .doc('user-metadata')
+        .get();
+      const candidatePrefs = candidatePrefsSnap.exists ? candidatePrefsSnap.data() : {};
+
+      const candidateMetadataSnap = await db
+        .collection('users')
+        .doc(candidateId)
+        .collection('user-metadata')
+        .doc('matches')
+        .get();
+      const candidateDeclined = candidateMetadataSnap.exists
+        ? candidateMetadataSnap.data() ?? {}
+        : {};
+
+      if (candidateDeclined[rematchUid]?.declined) continue;
+
+      // Calculate match type
+      const matchType = calculateMatchType(
+        rematchPrefs?.matchingIntent || 'friends',
+        rematchPrefs?.gender || '',
+        rematchPrefs?.genderInterest || '',
+        candidatePrefs?.matchingIntent || 'friends',
+        candidatePrefs?.gender || '',
+        candidatePrefs?.genderInterest || ''
+      );
+
+      const channelName = `channel_${Date.now()}`;
+
+      // Create the match
+      await Promise.all([
+        queueRef.doc(rematchUid).update({
+          state: 'match-pending',
+          partnerId: candidateId,
+          channelName,
+          accepted: false,
+          timestamp: Date.now(),
+          rematchDeadline: null, // Clear deadline
+          declinedBy: null, // Clear declined tracking
+          topic: candidateData.prefs?.topic || null,
+          matchType,
+          partnerMatchingIntent: candidatePrefs?.matchingIntent || 'friends',
+        }),
+        queueRef.doc(candidateId).update({
+          state: 'match-pending',
+          partnerId: rematchUid,
+          channelName,
+          accepted: false,
+          timestamp: Date.now(),
+          topic: rematchData.prefs?.topic || null,
+          matchType,
+          partnerMatchingIntent: rematchPrefs?.matchingIntent || 'friends',
+        }),
+      ]);
+
+      console.log(`✨ Rematched ${rematchUid} with ${candidateId} as ${matchType}`);
+      return; // Exit after successful rematch
+    }
+  }
+
+  // Regular matching for searching users
   for (let i = 0; i < users.length; i++) {
     const user = users[i];
     const uid = user.id;
