@@ -79,8 +79,22 @@ export const matchUsers = async () => {
         state: 'rematch-timeout',
         timestamp: now,
       });
-      console.log(`⏰ ${doc.id} rematch window expired, showing timeout message`);
+      console.log(`⏰ ${doc.id} rematch window expired, transitioned to rematch-timeout`);
     }
+  }
+
+  // Now transition any "rematch-timeout" users back to "searching"
+  const timeoutSnapshot = await queueRef
+    .where('state', '==', 'rematch-timeout')
+    .get();
+
+  for (const doc of timeoutSnapshot.docs) {
+    await queueRef.doc(doc.id).update({
+      state: 'searching',
+      timestamp: now,
+      rematchDeadline: null,
+    });
+    console.log(`🔄 ${doc.id} transitioned from rematch-timeout back to searching`);
   }
 
   // Fetch all users in "waiting-for-rematch" (not expired)

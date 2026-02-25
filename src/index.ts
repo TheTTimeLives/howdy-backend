@@ -241,7 +241,7 @@ try {
     console.log('⏰ Transcript backfill cron scheduled for 02:30 daily');
   }
 
-  // Lightweight TTL cleanup for stale matchQueue entries
+  // Lightweight TTL cleanup for stale matchQueue entries + run matchmaker
   const cron2 = require('node-cron');
   cron2.schedule('*/1 * * * *', async () => {
     try {
@@ -279,11 +279,26 @@ try {
           timestamp: Date.now(),
         });
       }
+
+      // Run matchmaker to check for rematch timeouts and make new matches
+      const { matchUsers } = await import('./services/matchmaker');
+      await matchUsers();
     } catch (e) {
       console.warn('⚠️ matchQueue TTL cleanup failed:', e);
     }
   });
-  console.log('⏰ matchQueue TTL cleanup scheduled every minute');
+  console.log('⏰ matchQueue TTL cleanup + matchmaker scheduled every minute');
+
+  // Run matchmaker more frequently (every 5 seconds) to handle rematch timeouts quickly
+  setInterval(async () => {
+    try {
+      const { matchUsers } = await import('./services/matchmaker');
+      await matchUsers();
+    } catch (e) {
+      // Silent failure - matchmaker will retry on next interval
+    }
+  }, 5000); // 5 seconds
+  console.log('⏰ Fast matchmaker scheduled every 5 seconds');
 } catch (e) {
   console.warn('⚠️ Failed to schedule transcript backfill cron:', e);
 }

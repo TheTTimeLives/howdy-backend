@@ -34,6 +34,15 @@ usersRouter.get('/me', async (req, res) => {
         metadata?.onboardingStage ?? 'bio',
         metadata?.primaryGroupId ?? null
       );
+      // Log matching intent fields from metadata
+      console.log(
+        '[USERS /me] 🔍 RAW metadata fields: matchingIntent=%s gender=%s genderInterest=%s',
+        metadata?.matchingIntent ?? 'undefined',
+        metadata?.gender ?? 'undefined',
+        metadata?.genderInterest ?? 'undefined'
+      );
+      // Also check if they might be nested or have different names
+      console.log('[USERS /me] 🔍 All metadata keys:', Object.keys(metadata || {}));
     } catch (_e) {
       // ignore log errors
     }
@@ -637,5 +646,153 @@ usersRouter.put('/members/:memberId/settings', async (req, res) => {
   } catch (e) {
     console.error('❌ PUT member settings failed', e);
     return res.status(500).json({ error: 'Failed to save settings' });
+  }
+});
+
+// ===== Review & Connection Endpoints =====
+
+// GET /users/:uid/connection-status - Check connection status with another user
+usersRouter.get('/:uid/connection-status', async (req, res) => {
+  const currentUid = (req as any).uid;
+  const targetUid = String(req.params.uid || '');
+  
+  if (!targetUid) {
+    return res.status(400).json({ error: 'Missing target user ID' });
+  }
+
+  try {
+    // Check if connection is confirmed
+    const confirmedDoc = await db
+      .collection('connections')
+      .doc(targetUid)
+      .collection('confirmed')
+      .doc(currentUid)
+      .get();
+
+    if (confirmedDoc.exists) {
+      return res.status(200).json({ status: 'confirmed' });
+    }
+
+    // Check if request is pending
+    const pendingDoc = await db
+      .collection('connections')
+      .doc(targetUid)
+      .collection('requests')
+      .doc(currentUid)
+      .get();
+
+    if (pendingDoc.exists) {
+      return res.status(200).json({ status: 'pending' });
+    }
+
+    return res.status(200).json({ status: 'none' });
+  } catch (e) {
+    console.error(`❌ Failed to check connection status for ${currentUid} -> ${targetUid}:`, e);
+    return res.status(500).json({ error: 'Failed to check connection status' });
+  }
+});
+
+// POST /users/:uid/reviews - Submit a review for another user
+usersRouter.post('/:uid/reviews', async (req, res) => {
+  const currentUid = (req as any).uid;
+  const targetUid = String(req.params.uid || '');
+  const { rating, comment, superlatives } = req.body;
+
+  if (!targetUid) {
+    return res.status(400).json({ error: 'Missing target user ID' });
+  }
+
+  if (typeof rating !== 'number' || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: 'Invalid rating (must be 1-5)' });
+  }
+
+  try {
+    const reviewData: any = {
+      rating,
+      timestamp: Date.now(),
+    };
+
+    if (superlatives && Array.isArray(superlatives) && superlatives.length > 0) {
+      reviewData.superlatives = superlatives;
+    }
+
+    if (comment && typeof comment === 'string' && comment.trim().length > 0) {
+      reviewData.comment = comment.trim();
+    }
+
+    // Store review in the target user's reviews collection
+    await db
+      .collection('users')
+      .doc(targetUid)
+      .collection('user-metadata')
+      .doc('reviews')
+      .set({ [currentUid]: reviewData }, { merge: true });
+
+    console.log(`✅ Review submitted: ${currentUid} -> ${targetUid} (${rating} stars)`);
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error(`❌ Failed to submit review for ${currentUid} -> ${targetUid}:`, e);
+    return res.status(500).json({ error: 'Failed to submit review' });
+  }
+});
+
+// POST /users/:uid/connection-request - Send a connection request to another user
+usersRouter.post('/:uid/connection-request', async (req, res) => {
+  const currentUid = (req as any).uid;
+  const targetUid = String(req.params.uid || '');
+
+  if (!targetUid) {
+    return res.status(400).json({ error: 'Missing target user ID' });
+  }
+
+  if (currentUid === targetUid) {
+    return res.status(400).json({ error: 'Cannot connect to yourself' });
+  }
+
+  try {
+    // Get current user's username
+    const currentUserDoc = await db.collection('user_metadata').doc(currentUid).get();
+    const username = currentUserDoc.data()?.username || 'Unknown';
+
+    // Check if already connected
+    const confirmedDoc = await db
+      .collection('connections')
+      .doc(targetUid)
+      .collection('confirmed')
+      .doc(currentUid)
+      .get();
+
+    if (confirmedDoc.exists) {
+      return res.status(400).json({ error: 'Already connected' });
+    }
+
+    // Check if request already sent
+    const pendingDoc = await db
+      .collection('connections')
+      .doc(targetUid)
+      .collection('requests')
+      .doc(currentUid)
+      .get();
+
+    if (pendingDoc.exists) {
+      return res.status(400).json({ error: 'Request already sent' });
+    }
+
+    // Send connection request
+    await db
+      .collection('connections')
+      .doc(targetUid)
+      .collection('requests')
+      .doc(currentUid)
+      .set({
+        username,
+        timestamp: Date.now(),
+      });
+
+    console.log(`✅ Connection request sent: ${currentUid} (${username}) -> ${targetUid}`);
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error(`❌ Failed to send connection request from ${currentUid} -> ${targetUid}:`, e);
+    return res.status(500).json({ error: 'Failed to send connection request' });
   }
 });

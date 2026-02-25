@@ -13,7 +13,30 @@ matchActionsRouter.post('/accept', async (req, res) => {
   if (!doc.exists) return res.status(404).json({ error: 'Not in queue' });
 
   const data = doc.data();
-  if (!data || data.state !== 'match-pending') {
+  if (!data) return res.status(400).json({ error: 'Invalid queue state' });
+
+  // If state is 'searching', the partner likely declined before this user clicked accept
+  // Put them in waiting-for-rematch state to search for a new match
+  if (data.state === 'searching') {
+    console.log(`⏳ ${uid} accepted after partner declined, entering waiting-for-rematch`);
+    
+    // Get user's match wait timeout (default 15 seconds)
+    const userMetaDoc = await db.collection('user_metadata').doc(uid).get();
+    const matchWaitTimeoutMs = (userMetaDoc.data()?.matchWaitTimeoutSeconds ?? 15) * 1000;
+    
+    await docRef.update({
+      state: 'waiting-for-rematch',
+      accepted: false,
+      partnerId: null,
+      channelName: null,
+      rematchDeadline: Date.now() + matchWaitTimeoutMs,
+      timestamp: Date.now(),
+    });
+    
+    return res.status(200).json({ status: 'waiting-for-rematch' });
+  }
+
+  if (data.state !== 'match-pending') {
     return res.status(400).json({ error: 'No pending match' });
   }
 
@@ -104,9 +127,9 @@ matchActionsRouter.post('/decline', async (req, res) => {
   const partnerDoc = await partnerRef.get();
   const partnerData = partnerDoc.data();
 
-  // Get partner's match wait timeout (default 30 seconds)
+  // Get partner's match wait timeout (default 15 seconds)
   const partnerMetaDoc = await db.collection('user_metadata').doc(partnerId).get();
-  const matchWaitTimeoutMs = (partnerMetaDoc.data()?.matchWaitTimeoutSeconds ?? 30) * 1000;
+  const matchWaitTimeoutMs = (partnerMetaDoc.data()?.matchWaitTimeoutSeconds ?? 15) * 1000;
 
   const now = Date.now();
 

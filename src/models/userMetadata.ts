@@ -31,7 +31,7 @@ export const UserMetadataDocSchema = z.object({
   chiDailyKey: z.string().nullable().optional(),
   chiDailyCount: z.number().nullable().optional(),
   // Timer settings for matching and calls
-  matchWaitTimeoutSeconds: z.number().nullable().optional(), // Default 30s
+  matchWaitTimeoutSeconds: z.number().nullable().optional(), // Default 15s
   reconnectionGracePeriodSeconds: z.number().nullable().optional(), // Default 60s
 });
 
