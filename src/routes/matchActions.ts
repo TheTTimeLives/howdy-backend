@@ -1,6 +1,7 @@
 import express from 'express';
 import { db } from '../firebase';
 import { verifyJwt } from '../verifyJwt';
+import { recordDeclineInfraction } from '../services/behaviorInfractions';
 
 export const matchActionsRouter = express.Router();
 matchActionsRouter.use(verifyJwt);
@@ -189,8 +190,19 @@ matchActionsRouter.post('/decline', async (req, res) => {
     ),
   ]);
 
+  // Phase 1: telemetry only (no enforcement side effects).
+  let moderation = null;
+  try {
+    moderation = await recordDeclineInfraction(uid, { partnerId });
+    if (moderation?.recommendedTakeOffline) {
+      await db.collection('matchQueue').doc(uid).delete().catch(() => {});
+    }
+  } catch (e) {
+    console.warn('⚠️ Failed to record decline infraction:', e);
+  }
+
   console.log('❌ Match declined by', uid);
-  return res.status(200).json({ status: 'declined' });
+  return res.status(200).json({ status: 'declined', moderation });
 });
 
 matchActionsRouter.post('/call/end', async (req, res) => {

@@ -2,6 +2,7 @@ import express from 'express';
 import { db } from '../firebase';
 import { verifyJwt } from '../verifyJwt';
 import { matchUsers } from '../services/matchmaker';
+import { getGoLiveLockStatus } from '../services/behaviorInfractions';
 
 export const enqueueRouter = express.Router();
 enqueueRouter.use(verifyJwt);
@@ -15,6 +16,20 @@ enqueueRouter.post('/', async (req, res) => {
   }
 
   try {
+    const lock = await getGoLiveLockStatus(uid);
+    if (lock.isLocked) {
+      return res.status(423).json({
+        error: 'GO_LIVE_LOCKED',
+        lockUntil: lock.lockUntil,
+        moderation: {
+          notice: lock.notice,
+          recommendedTakeOffline: true,
+          recommendedLockUntil: lock.lockUntil,
+          reason: 'enqueue_lock_active',
+        },
+      });
+    }
+
     await db.collection('matchQueue').doc(uid).set({
       prefs,
       topic: prefs.topic || null, // ✅ Save optional topic

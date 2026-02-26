@@ -6,6 +6,7 @@ import { RtcTokenBuilder, RtcRole } from 'agora-access-token';
 import fetch from 'node-fetch';
 import { Storage, type File } from '@google-cloud/storage';
 import { FieldValue } from 'firebase-admin/firestore';
+import { recordShortCallInfraction } from '../services/behaviorInfractions';
 
 export const callsRouter = express.Router();
 callsRouter.use(verifyJwt);
@@ -545,25 +546,45 @@ callsRouter.post('/:channelName/end', async (req, res) => {
     const { channelName } = req.params;
     const { reason } = req.body || {};
     const ref = channelDocRef(channelName);
+    const endedAt = Date.now();
+    let startedAt: number | null = null;
 
     // Mark call inactive (idempotent)
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       if (!snap.exists) return;
       const data = snap.data() || {};
+      const started = Number(data.startedAt || 0);
+      if (started > 0) startedAt = started;
       if (data.active === false) return;
       tx.set(
         ref,
         {
           active: false,
-          endedAt: Date.now(),
+          endedAt,
           endedBy: ender,
           endReason: reason || 'ended',
-          lastSeenAt: Date.now(),
+          lastSeenAt: endedAt,
         },
         { merge: true }
       );
     });
+
+    // Phase 1: telemetry only (no enforcement side effects).
+    let moderation = null;
+    if (startedAt && endedAt >= startedAt) {
+      const durationSec = Math.floor((endedAt - startedAt) / 1000);
+      if (durationSec <= 20) {
+        try {
+          moderation = await recordShortCallInfraction(ender, {
+            channelName,
+            durationSec,
+          });
+        } catch (e) {
+          console.warn('⚠️ Failed to record short-call infraction:', e);
+        }
+      }
+    }
 
     // Stop recording once (stop lock)
     let stopLockId: string | null = null;
@@ -634,7 +655,7 @@ callsRouter.post('/:channelName/end', async (req, res) => {
       }, 30_000);
     }
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, moderation });
   } catch (e) {
     console.error('❌ /calls/:channelName/end error', e);
     return res.status(500).json({ error: 'Internal Error' });
