@@ -100,6 +100,20 @@ function basicAuthHeader(id: string, secret: string) {
   return `Basic ${b64}`;
 }
 
+function normalizeDisconnections(raw: any): Record<string, { disconnectedAt: number; reconnectionDeadline: number }> {
+  if (!raw || typeof raw !== 'object') return {};
+  const out: Record<string, { disconnectedAt: number; reconnectionDeadline: number }> = {};
+  for (const [uid, value] of Object.entries(raw as Record<string, any>)) {
+    if (!uid) continue;
+    const disconnectedAt = Number(value?.disconnectedAt || 0);
+    const reconnectionDeadline = Number(value?.reconnectionDeadline || 0);
+    if (disconnectedAt > 0 && reconnectionDeadline > 0) {
+      out[uid] = { disconnectedAt, reconnectionDeadline };
+    }
+  }
+  return out;
+}
+
 // ========= Token =========
 
 function hashToInt32(input: string): number {
@@ -164,6 +178,14 @@ callsRouter.post('/start', async (req, res) => {
     const caller = (req as any).uid as string;
     const { channelName, participants = [] } = req.body || {};
     if (!channelName) return res.status(400).json({ error: 'Missing channelName' });
+
+    // User is now entering call flow: remove their queue presence immediately.
+    // Keep this best-effort so call setup is never blocked by queue cleanup issues.
+    try {
+      await db.collection('matchQueue').doc(caller).delete();
+    } catch (e) {
+      console.warn('⚠️ Failed to remove caller from matchQueue at /calls/start:', e);
+    }
 
     await ensureCallDoc(channelName, [caller, ...participants]);
 
@@ -287,13 +309,27 @@ callsRouter.post('/start', async (req, res) => {
 callsRouter.post('/:channelName/disconnect', async (req, res) => {
   try {
     const { channelName } = req.params;
-    const uid = (req as any).uid as string;
+    const requesterUid = (req as any).uid as string;
+    const requestedTargetUid = String((req.body || {}).targetUid || '').trim();
     
     const ref = channelDocRef(channelName);
     const snap = await ref.get();
     
     if (!snap.exists) {
       return res.status(404).json({ error: 'Call not found' });
+    }
+
+    const data = snap.data() || {};
+    const participants = Array.from(
+      new Set(
+        ((Array.isArray(data.participants) ? data.participants : []) as any[])
+          .map((x: any) => String(x || '').trim())
+          .filter((x: string) => x.length > 0)
+      )
+    );
+    const uid = requestedTargetUid || requesterUid;
+    if (!participants.includes(uid)) {
+      return res.status(400).json({ error: 'targetUid is not a call participant' });
     }
 
     // Get user's reconnection grace period setting (default 60 seconds)
@@ -310,7 +346,9 @@ callsRouter.post('/:channelName/disconnect', async (req, res) => {
       }
     }, { merge: true });
 
-    console.log(`🔌 ${uid} disconnected from ${channelName}, grace period: ${reconnectionGracePeriodMs}ms`);
+    console.log(
+      `🔌 ${uid} marked disconnected from ${channelName} by ${requesterUid}, grace period: ${reconnectionGracePeriodMs}ms`
+    );
     return res.status(200).json({ 
       ok: true, 
       reconnectionGracePeriodSeconds: reconnectionGracePeriodMs / 1000 
@@ -326,7 +364,8 @@ callsRouter.post('/:channelName/disconnect', async (req, res) => {
 callsRouter.post('/:channelName/reconnect', async (req, res) => {
   try {
     const { channelName } = req.params;
-    const uid = (req as any).uid as string;
+    const requesterUid = (req as any).uid as string;
+    const requestedTargetUid = String((req.body || {}).targetUid || '').trim();
     
     const ref = channelDocRef(channelName);
     const snap = await ref.get();
@@ -335,8 +374,20 @@ callsRouter.post('/:channelName/reconnect', async (req, res) => {
       return res.status(404).json({ error: 'Call not found' });
     }
 
-    // Clear disconnection for this user
     const data = snap.data() || {};
+    const participants = Array.from(
+      new Set(
+        ((Array.isArray(data.participants) ? data.participants : []) as any[])
+          .map((x: any) => String(x || '').trim())
+          .filter((x: string) => x.length > 0)
+      )
+    );
+    const uid = requestedTargetUid || requesterUid;
+    if (!participants.includes(uid)) {
+      return res.status(400).json({ error: 'targetUid is not a call participant' });
+    }
+
+    // Clear disconnection for this user
     const disconnections = data.disconnections || {};
     delete disconnections[uid];
 
@@ -345,7 +396,7 @@ callsRouter.post('/:channelName/reconnect', async (req, res) => {
       lastSeenAt: Date.now(),
     }, { merge: true });
 
-    console.log(`✅ ${uid} reconnected to ${channelName}`);
+    console.log(`✅ ${uid} marked reconnected to ${channelName} by ${requesterUid}`);
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error('❌ /calls/:channelName/reconnect error', e);
@@ -355,6 +406,78 @@ callsRouter.post('/:channelName/reconnect', async (req, res) => {
 
 // List active calls that include any member of the specified group
 // GET /calls/active?groupId=abc123
+callsRouter.get('/active/me', async (req, res) => {
+  try {
+    const uid = String((req as any).uid || '').trim();
+    if (!uid) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Avoid requiring a composite index; filter active calls in memory.
+    const callsSnap = await db
+      .collection('calls')
+      .where('participants', 'array-contains', uid)
+      .limit(50)
+      .get();
+
+    const now = Date.now();
+    let best: { id: string; data: any } | null = null;
+
+    for (const doc of callsSnap.docs) {
+      const data = doc.data() || {};
+      if (data.active !== true) continue;
+      const startedAt = Number(data.startedAt || 0);
+      if (!best || startedAt > Number(best.data.startedAt || 0)) {
+        best = { id: doc.id, data };
+      }
+    }
+
+    if (!best) return res.json({ call: null });
+
+    const data = best.data || {};
+    const participants: string[] = Array.from(
+      new Set(
+        ((Array.isArray(data.participants) ? data.participants : []) as any[])
+          .map((x: any) => String(x || '').trim())
+          .filter((x: string) => x.length > 0)
+      )
+    );
+    const partnerUid = participants.find((p) => p && p !== uid) || '';
+
+    let partnerUsername = partnerUid;
+    if (partnerUid) {
+      try {
+        const meta = await db.collection('user_metadata').doc(partnerUid).get();
+        const name = String(meta.data()?.username || '').trim();
+        if (name) partnerUsername = name;
+      } catch (_) {}
+    }
+
+    const disconnections = normalizeDisconnections(data.disconnections);
+    const mine = disconnections[uid];
+    const myReconnectionDeadline = mine?.reconnectionDeadline ?? null;
+    const myReconnectionSecondsLeft =
+      myReconnectionDeadline != null
+        ? Math.max(0, Math.ceil((myReconnectionDeadline - now) / 1000))
+        : null;
+
+    return res.json({
+      call: {
+        channelName:
+          String(data.channelName || String(best.id).replace(/^chan_/, '')),
+        partnerUid: partnerUid || null,
+        partnerUsername: partnerUsername || null,
+        startedAt: Number(data.startedAt || 0) || null,
+        myDisconnected:
+          myReconnectionSecondsLeft != null && myReconnectionSecondsLeft > 0,
+        myReconnectionDeadline,
+        myReconnectionSecondsLeft,
+      },
+    });
+  } catch (e) {
+    console.error('❌ /calls/active/me error', e);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+});
+
 callsRouter.get('/active', async (req, res) => {
   try {
     const groupId = String(req.query.groupId || '').trim();
@@ -522,17 +645,67 @@ callsRouter.get('/history', async (req, res) => {
 callsRouter.get('/:channelName/status', async (req, res) => {
   try {
     const { channelName } = req.params;
-    const snap = await channelDocRef(channelName).get();
+    const requesterUid = String((req as any).uid || '');
+    const ref = channelDocRef(channelName);
+    const snap = await ref.get();
     if (!snap.exists) return res.json({ active: false });
 
     const data = snap.data() || {};
+    const now = Date.now();
+    const disconnections = normalizeDisconnections(data.disconnections);
+    const participants = Array.from(
+      new Set(
+        ((Array.isArray(data.participants) ? data.participants : []) as any[])
+          .map((x: any) => String(x || '').trim())
+          .filter((x: string) => x.length > 0)
+      )
+    );
+
+    // Pulse-check reconnection deadlines during status polling.
+    const hasExpiredReconnection = Object.values(disconnections).some(
+      (d) => d.reconnectionDeadline <= now
+    );
+    if (data.active === true && hasExpiredReconnection) {
+      await ref.set(
+        {
+          active: false,
+          endedAt: now,
+          endedBy: 'system',
+          endReason: 'reconnection_timeout',
+          lastSeenAt: now,
+        },
+        { merge: true }
+      );
+      console.warn(
+        '⚠️ Call auto-ended due to expired reconnection window',
+        channelName
+      );
+    }
+
+    const partnerUid =
+      participants.find((p) => p && p !== requesterUid) || null;
+    const partnerDisconnect = partnerUid ? disconnections[partnerUid] : null;
+    const partnerReconnectionDeadline =
+      partnerDisconnect?.reconnectionDeadline ?? null;
+    const partnerReconnectionSecondsLeft =
+      partnerReconnectionDeadline != null
+        ? Math.max(0, Math.ceil((partnerReconnectionDeadline - now) / 1000))
+        : null;
+
+    const freshSnap = await ref.get();
+    const freshData = freshSnap.data() || {};
     return res.json({
-      active: !!data.active,
-      startedAt: data.startedAt || null,
-      endedAt: data.endedAt || null,
-      lastSeenAt: data.lastSeenAt || null,
-      rec: data.rec || null,
-      transcription: data.transcription || null,
+      active: !!freshData.active,
+      startedAt: freshData.startedAt || null,
+      endedAt: freshData.endedAt || null,
+      endReason: freshData.endReason || null,
+      lastSeenAt: freshData.lastSeenAt || null,
+      rec: freshData.rec || null,
+      transcription: freshData.transcription || null,
+      partnerDisconnected:
+        partnerReconnectionSecondsLeft != null && partnerReconnectionSecondsLeft > 0,
+      partnerReconnectionDeadline,
+      partnerReconnectionSecondsLeft,
     });
   } catch (e) {
     console.error('❌ /calls/:channelName/status error', e);

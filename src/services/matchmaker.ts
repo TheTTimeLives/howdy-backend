@@ -1,4 +1,7 @@
 import { db } from '../firebase';
+import { recordMatchTimeoutInfraction } from './behaviorInfractions';
+
+const MATCH_RESPONSE_TIMEOUT_MS = 30_000;
 
 /**
  * Check if two users are romantically compatible based on gender preferences
@@ -63,10 +66,105 @@ function calculateMatchType(
 
 export const matchUsers = async () => {
   const queueRef = db.collection('matchQueue');
+  const now = Date.now();
+
+  // Handle stale match-pending pairs that were never accepted/declined in time.
+  // Timeout is not a decline: we only clear pending match state and optionally
+  // move the accepted user into waiting-for-rematch.
+  const pendingSnapshot = await queueRef.where('state', '==', 'match-pending').get();
+  const pendingMap = new Map<string, any>();
+  for (const d of pendingSnapshot.docs) pendingMap.set(d.id, d.data() || {});
+  const processedPairs = new Set<string>();
+  for (const d of pendingSnapshot.docs) {
+    const uid = d.id;
+    const data = pendingMap.get(uid) || {};
+    const partnerId = String(data.partnerId || '').trim();
+    if (!partnerId) continue;
+    const pairKey = [uid, partnerId].sort().join('|');
+    if (processedPairs.has(pairKey)) continue;
+    processedPairs.add(pairKey);
+
+    const partnerData = pendingMap.get(partnerId);
+    if (!partnerData) continue;
+    if (String(partnerData.partnerId || '').trim() !== uid) continue;
+
+    const myExpiry = Number(data.pendingExpiresAt || 0);
+    const partnerExpiry = Number(partnerData.pendingExpiresAt || 0);
+    const expiry = Math.min(
+      myExpiry || (Number(data.timestamp || now) + MATCH_RESPONSE_TIMEOUT_MS),
+      partnerExpiry || (Number(partnerData.timestamp || now) + MATCH_RESPONSE_TIMEOUT_MS)
+    );
+    if (!expiry || now < expiry) continue;
+
+    const myAccepted = data.accepted === true;
+    const partnerAccepted = partnerData.accepted === true;
+    const channelName = String(data.channelName || partnerData.channelName || '').trim() || null;
+
+    const toTimeout: Array<{ timedOutUid: string; otherUid: string }> = [];
+    if (!myAccepted) toTimeout.push({ timedOutUid: uid, otherUid: partnerId });
+    if (!partnerAccepted) toTimeout.push({ timedOutUid: partnerId, otherUid: uid });
+
+    const timedOutLock = new Map<string, boolean>();
+    for (const t of toTimeout) {
+      try {
+        const moderation = await recordMatchTimeoutInfraction(t.timedOutUid, {
+          partnerId: t.otherUid,
+          channelName,
+        });
+        const takeOffline = moderation?.recommendedTakeOffline === true;
+        timedOutLock.set(t.timedOutUid, takeOffline);
+      } catch (e) {
+        console.warn('⚠️ Failed to record match-timeout infraction:', e);
+      }
+    }
+
+    // If one party accepted and the other timed out, keep accepted user warm for rematch.
+    const updates: Promise<any>[] = [];
+    const upsertSearching = (id: string) =>
+      queueRef.doc(id).update({
+        state: 'searching',
+        partnerId: null,
+        channelName: null,
+        accepted: false,
+        pendingExpiresAt: null,
+        timestamp: now,
+      });
+
+    const upsertWaitingRematch = async (id: string) => {
+      const userMetaDoc = await db.collection('user_metadata').doc(id).get();
+      const matchWaitTimeoutMs = (userMetaDoc.data()?.matchWaitTimeoutSeconds ?? 15) * 1000;
+      return queueRef.doc(id).update({
+        state: 'waiting-for-rematch',
+        accepted: false,
+        partnerId: null,
+        channelName: null,
+        pendingExpiresAt: null,
+        rematchDeadline: now + matchWaitTimeoutMs,
+        timestamp: now,
+      });
+    };
+
+    if (myAccepted && !partnerAccepted) {
+      if (timedOutLock.get(partnerId) === true) updates.push(queueRef.doc(partnerId).delete());
+      else updates.push(upsertSearching(partnerId));
+      updates.push(upsertWaitingRematch(uid));
+    } else if (!myAccepted && partnerAccepted) {
+      if (timedOutLock.get(uid) === true) updates.push(queueRef.doc(uid).delete());
+      else updates.push(upsertSearching(uid));
+      updates.push(upsertWaitingRematch(partnerId));
+    } else {
+      if (timedOutLock.get(uid) === true) updates.push(queueRef.doc(uid).delete());
+      else updates.push(upsertSearching(uid));
+      if (timedOutLock.get(partnerId) === true) updates.push(queueRef.doc(partnerId).delete());
+      else updates.push(upsertSearching(partnerId));
+    }
+
+    await Promise.all(updates);
+    console.log(`⏰ Match timed out between ${uid} and ${partnerId}`);
+  }
   
   // First, handle users in "waiting-for-rematch" state
   // Check for expired rematch windows
-  const now = Date.now();
   const rematchingSnapshot = await queueRef
     .where('state', '==', 'waiting-for-rematch')
     .get();
@@ -189,6 +287,7 @@ export const matchUsers = async () => {
           partnerId: candidateId,
           channelName,
           accepted: false,
+          pendingExpiresAt: Date.now() + MATCH_RESPONSE_TIMEOUT_MS,
           timestamp: Date.now(),
           rematchDeadline: null, // Clear deadline
           declinedBy: null, // Clear declined tracking
@@ -201,6 +300,7 @@ export const matchUsers = async () => {
           partnerId: rematchUid,
           channelName,
           accepted: false,
+          pendingExpiresAt: Date.now() + MATCH_RESPONSE_TIMEOUT_MS,
           timestamp: Date.now(),
           topic: rematchData.prefs?.topic || null,
           matchType,
@@ -286,6 +386,7 @@ export const matchUsers = async () => {
           partnerId: candidateId,
           channelName,
           accepted: false,
+          pendingExpiresAt: Date.now() + MATCH_RESPONSE_TIMEOUT_MS,
           timestamp: Date.now(),
           topic: candidate.data().prefs?.topic || null,
           matchType, // Store the calculated match type
@@ -296,6 +397,7 @@ export const matchUsers = async () => {
           partnerId: uid,
           channelName,
           accepted: false,
+          pendingExpiresAt: Date.now() + MATCH_RESPONSE_TIMEOUT_MS,
           timestamp: Date.now(),
           topic: user.data().prefs?.topic || null,
           matchType, // Store the calculated match type
