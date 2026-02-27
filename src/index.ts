@@ -289,7 +289,7 @@ try {
   });
   console.log('⏰ matchQueue TTL cleanup + matchmaker scheduled every minute');
 
-  // Run matchmaker more frequently (every 5 seconds) to handle rematch timeouts quickly
+  // Fast matchmaker cadence for timeout/rematch flow
   setInterval(async () => {
     try {
       const { matchUsers } = await import('./services/matchmaker');

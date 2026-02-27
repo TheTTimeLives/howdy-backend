@@ -2,6 +2,13 @@ import { db } from '../firebase';
 import { recordMatchTimeoutInfraction } from './behaviorInfractions';
 
 const MATCH_RESPONSE_TIMEOUT_MS = 30_000;
+const MATCH_TIMEOUT_REMATCH_BUFFER_MS = 15 * 60 * 1000;
+
+function isPairTemporarilyBlocked(meta: any, now: number): boolean {
+  if (!meta || typeof meta !== 'object') return false;
+  const timeoutUntil = Number(meta.timeoutUntil || 0);
+  return timeoutUntil > now;
+}
 
 /**
  * Check if two users are romantically compatible based on gender preferences
@@ -71,7 +78,9 @@ export const matchUsers = async () => {
   // Handle stale match-pending pairs that were never accepted/declined in time.
   // Timeout is not a decline: we only clear pending match state and optionally
   // move the accepted user into waiting-for-rematch.
-  const pendingSnapshot = await queueRef.where('state', '==', 'match-pending').get();
+  const pendingSnapshot = await queueRef
+    .where('state', 'in', ['match-pending', 'match-accepted-pending'])
+    .get();
   const pendingMap = new Map<string, any>();
   for (const d of pendingSnapshot.docs) pendingMap.set(d.id, d.data() || {});
   const processedPairs = new Set<string>();
@@ -96,8 +105,11 @@ export const matchUsers = async () => {
     );
     if (!expiry || now < expiry) continue;
 
-    const myAccepted = data.accepted === true;
-    const partnerAccepted = partnerData.accepted === true;
+    const myAccepted =
+      data.accepted === true || String(data.state || '') === 'match-accepted-pending';
+    const partnerAccepted =
+      partnerData.accepted === true ||
+      String(partnerData.state || '') === 'match-accepted-pending';
     const channelName = String(data.channelName || partnerData.channelName || '').trim() || null;
 
     const toTimeout: Array<{ timedOutUid: string; otherUid: string }> = [];
@@ -105,6 +117,7 @@ export const matchUsers = async () => {
     if (!partnerAccepted) toTimeout.push({ timedOutUid: partnerId, otherUid: uid });
 
     const timedOutLock = new Map<string, boolean>();
+    const cooldownWrites: Promise<any>[] = [];
     for (const t of toTimeout) {
       try {
         const moderation = await recordMatchTimeoutInfraction(t.timedOutUid, {
@@ -113,10 +126,27 @@ export const matchUsers = async () => {
         });
         const takeOffline = moderation?.recommendedTakeOffline === true;
         timedOutLock.set(t.timedOutUid, takeOffline);
+        cooldownWrites.push(
+          db
+            .collection('users')
+            .doc(t.timedOutUid)
+            .collection('user-metadata')
+            .doc('matches')
+            .set(
+              {
+                [t.otherUid]: {
+                  timeoutUntil: now + MATCH_TIMEOUT_REMATCH_BUFFER_MS,
+                  timeoutAt: now,
+                },
+              },
+              { merge: true }
+            )
+        );
       } catch (e) {
         console.warn('⚠️ Failed to record match-timeout infraction:', e);
       }
     }
+    await Promise.all(cooldownWrites);
 
     // If one party accepted and the other timed out, keep accepted user warm for rematch.
     const updates: Promise<any>[] = [];
@@ -246,6 +276,7 @@ export const matchUsers = async () => {
 
       // Skip if previously declined
       if (rematchPreviouslyMatched[candidateId]?.declined) continue;
+      if (isPairTemporarilyBlocked(rematchPreviouslyMatched[candidateId], now)) continue;
 
       // Fetch candidate's preferences
       const candidatePrefsSnap = await db
@@ -267,6 +298,7 @@ export const matchUsers = async () => {
         : {};
 
       if (candidateDeclined[rematchUid]?.declined) continue;
+      if (isPairTemporarilyBlocked(candidateDeclined[rematchUid], now)) continue;
 
       // Calculate match type
       const matchType = calculateMatchType(
@@ -345,6 +377,7 @@ export const matchUsers = async () => {
       const candidateData = candidate.data();
 
       if (previouslyMatched[candidateId]?.declined) continue;
+      if (isPairTemporarilyBlocked(previouslyMatched[candidateId], now)) continue;
 
       // Fetch candidate's preferences
       const candidatePrefsSnap = await db
@@ -367,6 +400,7 @@ export const matchUsers = async () => {
         : {};
 
       if (candidateDeclined[uid]?.declined) continue;
+      if (isPairTemporarilyBlocked(candidateDeclined[uid], now)) continue;
 
       // Calculate the match type based on both users' preferences
       const matchType = calculateMatchType(
