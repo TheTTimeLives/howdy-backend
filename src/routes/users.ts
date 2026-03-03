@@ -24,28 +24,6 @@ usersRouter.get('/me', async (req, res) => {
     }
 
     const metadata = metadataDoc.data();
-    // Debug log to trace routing inputs
-    try {
-      console.log(
-        '[USERS /me] uid=%s verified=%s acct=%s stage=%s group=%s',
-        uid,
-        metadata?.verificationStatus ?? 'awaiting',
-        metadata?.accountType ?? 'individual',
-        metadata?.onboardingStage ?? 'bio',
-        metadata?.primaryGroupId ?? null
-      );
-      // Log matching intent fields from metadata
-      console.log(
-        '[USERS /me] 🔍 RAW metadata fields: matchingIntent=%s gender=%s genderInterest=%s',
-        metadata?.matchingIntent ?? 'undefined',
-        metadata?.gender ?? 'undefined',
-        metadata?.genderInterest ?? 'undefined'
-      );
-      // Also check if they might be nested or have different names
-      console.log('[USERS /me] 🔍 All metadata keys:', Object.keys(metadata || {}));
-    } catch (_e) {
-      // ignore log errors
-    }
     const userDoc = await db.collection('users').doc(uid).get();
     const userData = userDoc.data() || {};
     const joinedPoolIds: string[] = metadata?.joinedPools || [];
@@ -90,7 +68,6 @@ usersRouter.get('/me', async (req, res) => {
     let firstName: string | null = null;
     let lastName: string | null = null;
     if (userData?.pii) {
-      console.log('🔊 userData.pii:', userData.pii);
       if (typeof userData.pii.firstNameEnc === 'string') {
         firstName = decryptString(userData.pii.firstNameEnc);
       }

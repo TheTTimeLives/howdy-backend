@@ -145,6 +145,7 @@ matchActionsRouter.post('/decline', async (req, res) => {
       partnerId: null,
       channelName: null,
       accepted: false,
+      pendingExpiresAt: null,
       rematchDeadline: now + matchWaitTimeoutMs,
       declinedBy: uid, // Track who declined
     });
@@ -156,6 +157,7 @@ matchActionsRouter.post('/decline', async (req, res) => {
       partnerId: null,
       channelName: null,
       accepted: false,
+      pendingExpiresAt: null,
     });
   }
 
@@ -165,6 +167,7 @@ matchActionsRouter.post('/decline', async (req, res) => {
     partnerId: null,
     channelName: null,
     accepted: false,
+    pendingExpiresAt: null,
   });
 
   const userMetadataRef = db

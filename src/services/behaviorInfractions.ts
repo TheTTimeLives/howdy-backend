@@ -247,3 +247,89 @@ export async function recordShortCallInfraction(
   });
   return result;
 }
+
+export async function recordMatchTimeoutInfraction(
+  uid: string,
+  details: { partnerId?: string | null; channelName?: string | null }
+): Promise<ModerationEvaluation> {
+  const now = Date.now();
+  const weekKey = getWeekKey(now);
+  const ref = db.collection('behavior_infractions').doc(uid);
+  const result: ModerationEvaluation = {
+    notice: null,
+    recommendedTakeOffline: false,
+    recommendedLockUntil: null,
+    reason: null,
+  };
+
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.exists ? (snap.data() || {}) : {};
+
+    const prevWeek = (data as any).weeklyMatchTimeouts?.weekKey || '';
+    const prevCount =
+      prevWeek === weekKey ? Number((data as any).weeklyMatchTimeouts?.count || 0) : 0;
+    const nextCount = prevCount + 1;
+    const existingLockUntil = Number((data as any).goLiveLock?.until || 0);
+    const isLocked = existingLockUntil > now;
+
+    if (isLocked) {
+      result.notice = lockNotice(existingLockUntil);
+      result.recommendedTakeOffline = true;
+      result.recommendedLockUntil = existingLockUntil;
+      result.reason = 'already_locked';
+    } else if (nextCount === 2) {
+      result.notice = {
+        title: 'Warning',
+        severity: 'warning',
+        message:
+          'You have timed out on two matches. Match timeouts do not count as declines, but repeated timeouts can temporarily lock you from going online. ' +
+          `If you feel like you have received this notice in error, please reach out to customer support at ${SUPPORT_EMAIL}.`,
+      };
+      result.reason = 'match_timeouts_warning';
+    } else if (nextCount >= 3) {
+      const lockUntil = now + ONE_WEEK_MS;
+      result.notice = lockNotice(lockUntil);
+      result.recommendedTakeOffline = true;
+      result.recommendedLockUntil = lockUntil;
+      result.reason = 'match_timeouts_week_lock';
+    }
+
+    tx.set(
+      ref,
+      {
+        uid,
+        updatedAt: now,
+        weeklyMatchTimeouts: {
+          weekKey,
+          count: nextCount,
+        },
+        ...(result.recommendedLockUntil != null
+            ? {
+                goLiveLock: {
+                  until: result.recommendedLockUntil,
+                  reason: result.reason,
+                  createdAt: now,
+                },
+              }
+            : {}),
+      },
+      { merge: true }
+    );
+
+    const eventRef = ref.collection('events').doc();
+    tx.set(eventRef, {
+      type: 'match_timeout',
+      createdAt: now,
+      weekKey,
+      details: {
+        partnerId: details.partnerId || null,
+        channelName: details.channelName || null,
+        countForWeek: nextCount,
+      },
+      moderation: result,
+    });
+  });
+
+  return result;
+}
