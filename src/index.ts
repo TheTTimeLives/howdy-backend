@@ -26,6 +26,7 @@ import { callsRouter, assemblyAiWebhookHandler } from './routes/calls';
 import { devicesRouter, devicesPublicRouter } from './routes/devices';
 import { eventsRouter } from './routes/events';
 import { availabilityRouter } from './routes/availability';
+import { adminRouter } from './routes/admin';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const cron = require('node-cron');
@@ -220,6 +221,7 @@ app.use('/onboarding', onboardingRouter);
 app.use('/devices', devicesRouter);
 app.use('/events', eventsRouter);
 app.use('/availability', availabilityRouter);
+app.use('/admin', adminRouter);
 
 const PORT = Number(process.env.PORT) || 5000;
 const HOST = '0.0.0.0';

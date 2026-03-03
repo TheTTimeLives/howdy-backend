@@ -1,8 +1,10 @@
 import express from 'express';
 import * as fs from 'fs';
+import crypto from 'crypto';
 import { db } from '../firebase';
 import { encryptString } from '../utils/pii';
 import { verifyJwt } from '../verifyJwt';
+import { logAuditEvent } from '../utils/audit';
 
 import {
   IDVClient,
@@ -46,6 +48,9 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const YOTI_WEBHOOK_URL =
   process.env.YOTI_WEBHOOK_URL ||
   (PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/yoti/webhook` : undefined);
+const ENFORCE_ID_COLLISION_REVIEW =
+  String(process.env.ENFORCE_ID_COLLISION_REVIEW ?? 'true').toLowerCase() ===
+  'true';
 
 if (isSandbox) {
   // 🔁 Redirect all IDVClient traffic to sandbox API
@@ -67,57 +72,248 @@ const idvClient = new IDVClient(YOTI_CLIENT_SDK_ID, YOTI_KEY, {
 export const yotiRouter = express.Router();
 yotiRouter.use(verifyJwt);
 
-// COMMENTED OUT: Custom deduplication logic (not currently in use)
-// Waiting for Yoti's built-in identity tracking solution
-// This function creates a hash from name+DOB and checks for duplicates in Firestore
-// Uncomment the calls to this function when ready to enable our deduplication
-async function checkIdentityDuplication(sessionResult: any, userId: string): Promise<{ isDuplicate: boolean; identityHash?: string }> {
-  try {
-    const textChecks = sessionResult.getIdDocumentTextDataChecks();
-    if (textChecks.length === 0) {
-      console.warn('⚠️ No ID document text checks found for deduplication');
-      return { isDuplicate: false };
+function normalizeName(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z\s'-]/g, ' ')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeDob(value: string): string | null {
+  const v = String(value || '').trim();
+  if (!v) return null;
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+
+  const m = v.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
+  if (!m) return null;
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  const yy = Number(m[3]);
+  const year = yy < 100 ? (yy >= 50 ? 1900 + yy : 2000 + yy) : yy;
+  if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1900) return null;
+  const mm = String(month).padStart(2, '0');
+  const dd = String(day).padStart(2, '0');
+  return `${year}-${mm}-${dd}`;
+}
+
+function extractIdentity(sessionResult: any): { fullNameNorm: string; dobNorm: string; first: string; last: string } | null {
+  const textChecks = sessionResult.getIdDocumentTextDataChecks?.() || [];
+  if (!Array.isArray(textChecks) || textChecks.length === 0) return null;
+
+  const check = textChecks[0];
+  const fields = (check as any).getDocumentFields?.();
+  if (!fields) return null;
+
+  const fullNameRaw = String(fields.getField('full_name')?.getValue?.() || '').trim();
+  const dobRaw = String(fields.getField('date_of_birth')?.getValue?.() || '').trim();
+  if (!fullNameRaw || !dobRaw) return null;
+
+  const fullNameNorm = normalizeName(fullNameRaw);
+  const dobNorm = normalizeDob(dobRaw);
+  if (!fullNameNorm || !dobNorm) return null;
+
+  const parts = fullNameNorm.split(' ').filter(Boolean);
+  const first = parts[0] || '';
+  const last = parts[parts.length - 1] || '';
+  if (!first || !last) return null;
+
+  return { fullNameNorm, dobNorm, first, last };
+}
+
+function makeBlockHashes(identity: { fullNameNorm: string; dobNorm: string; first: string; last: string }): string[] {
+  const firstInitial = identity.first.charAt(0);
+  const keys = [
+    `dob=${identity.dobNorm}|first=${identity.first}|last=${identity.last}`,
+    `dob=${identity.dobNorm}|last=${identity.last}|fi=${firstInitial}`,
+    `dob=${identity.dobNorm}|name=${identity.fullNameNorm}`,
+  ];
+  return keys.map((key) => crypto.createHash('sha256').update(key).digest('hex'));
+}
+
+function evaluateChecks(sessionResult: any): { allChecksComplete: boolean; approved: boolean } {
+  const checks = sessionResult.getChecks?.() || [];
+  let allChecksComplete = true;
+  let approved = true;
+  for (const check of checks) {
+    const recommendation = check.getReport?.()?.getRecommendation?.()?.getValue?.();
+    if (!recommendation || recommendation === 'PENDING') {
+      allChecksComplete = false;
+      break;
     }
+    if (recommendation !== 'APPROVE') approved = false;
+  }
+  return { allChecksComplete, approved };
+}
 
-    const check = textChecks[0];
-    const fields = (check as any).getDocumentFields?.();
+async function upsertIdentityAndFindCollisions(userId: string, identity: { fullNameNorm: string; dobNorm: string; first: string; last: string }) {
+  const now = Date.now();
+  const hashes = makeBlockHashes(identity);
 
-    if (!fields) {
-      console.warn('⚠️ No document fields found');
-      return { isDuplicate: false };
-    }
+  await db.collection('identity_profiles').doc(userId).set(
+    {
+      userId,
+      fullNameNormEnc: encryptString(identity.fullNameNorm),
+      dobNormEnc: encryptString(identity.dobNorm),
+      fullNameNormHash: crypto.createHash('sha256').update(identity.fullNameNorm).digest('hex'),
+      dobNormHash: crypto.createHash('sha256').update(identity.dobNorm).digest('hex'),
+      updatedAt: now,
+      createdAt: now,
+    },
+    { merge: true }
+  );
 
-    const fullName = fields.getField('full_name')?.getValue();
-    const dob = fields.getField('date_of_birth')?.getValue();
+  for (let i = 0; i < hashes.length; i++) {
+    const keyHash = hashes[i];
+    const docId = `${userId}_${i}_${keyHash.slice(0, 24)}`;
+    await db.collection('identity_block_keys').doc(docId).set(
+      { userId, keyHash, createdAt: now, updatedAt: now },
+      { merge: true }
+    );
+  }
 
-    if (!fullName || !dob) {
-      console.warn('⚠️ Missing identity fields (name or dob)');
-      return { isDuplicate: false };
-    }
-
-    // Create unique identity hash using ONLY name + DOB
-    // This prevents bypass via different document types (passport vs ID)
-    const rawString = `${fullName}|${dob}`;
-    const crypto = await import('crypto');
-    const hash = crypto.createHash('sha256').update(rawString).digest('hex');
-
-    // Check for existing identity (exclude current user)
-    const existing = await db
-      .collection('user_metadata')
-      .where('identityHash', '==', hash)
+  const candidateUserIds = new Set<string>();
+  for (const keyHash of hashes) {
+    const snap = await db
+      .collection('identity_block_keys')
+      .where('keyHash', '==', keyHash)
+      .limit(30)
       .get();
+    for (const doc of snap.docs) {
+      const matchUid = String(doc.data().userId || '');
+      if (matchUid && matchUid !== userId) candidateUserIds.add(matchUid);
+    }
+  }
+  return { hashes, candidateUserIds: Array.from(candidateUserIds) };
+}
 
-    const duplicateExists = !existing.empty && existing.docs.some(doc => doc.id !== userId);
+async function createOrReuseCollisionCase(userId: string, identity: { fullNameNorm: string; dobNorm: string }, candidateUserIds: string[]) {
+  const existing = await db
+    .collection('identity_collision_cases')
+    .where('userId', '==', userId)
+    .where('status', '==', 'pending_review')
+    .limit(1)
+    .get();
+  if (!existing.empty) return existing.docs[0].id;
 
-    if (duplicateExists) {
-      console.warn(`⚠️ Duplicate identity detected: ${fullName}, hash: ${hash.substring(0, 16)}...`);
-      return { isDuplicate: true, identityHash: hash };
+  const now = Date.now();
+  const ref = await db.collection('identity_collision_cases').add({
+    userId,
+    candidateUserIds,
+    status: 'pending_review',
+    collisionType: 'identity_block_key',
+    fullNameNormEnc: encryptString(identity.fullNameNorm),
+    dobNormEnc: encryptString(identity.dobNorm),
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  await logAuditEvent({
+    actorUid: null,
+    actorType: 'system',
+    action: 'collision_case_created',
+    entityType: 'identity_collision_case',
+    entityId: ref.id,
+    metadata: { userId, candidateCount: candidateUserIds.length },
+  });
+
+  return ref.id;
+}
+
+async function processSessionResult(userId: string, sessionResult: any, source: 'status_poll' | 'webhook') {
+  try {
+    const { allChecksComplete, approved } = evaluateChecks(sessionResult);
+    if (!allChecksComplete) {
+      await db.collection('user_metadata').doc(userId).set(
+        { verificationStatus: 'processing' },
+        { merge: true }
+      );
+      return 'processing';
     }
 
-    return { isDuplicate: false, identityHash: hash };
+    if (!approved) {
+      await db.collection('user_metadata').doc(userId).set(
+        { verificationStatus: 'denied' },
+        { merge: true }
+      );
+      await logAuditEvent({
+        actorUid: null,
+        actorType: 'system',
+        action: 'verification_denied',
+        entityType: 'user_metadata',
+        entityId: userId,
+        metadata: { source },
+      });
+      return 'denied';
+    }
+
+    const identity = extractIdentity(sessionResult);
+    if (!identity) {
+      await db.collection('user_metadata').doc(userId).set(
+        { verificationStatus: 'processing' },
+        { merge: true }
+      );
+      return 'processing';
+    }
+
+    const { candidateUserIds } = await upsertIdentityAndFindCollisions(userId, identity);
+
+    if (candidateUserIds.length > 0) {
+      const caseId = await createOrReuseCollisionCase(userId, identity, candidateUserIds);
+      if (ENFORCE_ID_COLLISION_REVIEW) {
+        await db.collection('user_metadata').doc(userId).set(
+          {
+            verificationStatus: 'manual-review',
+            identityCollisionCaseId: caseId,
+            identityCollisionBypassed: false,
+          },
+          { merge: true }
+        );
+        await logAuditEvent({
+          actorUid: null,
+          actorType: 'system',
+          action: 'verification_manual_review',
+          entityType: 'user_metadata',
+          entityId: userId,
+          metadata: { source, caseId, candidateCount: candidateUserIds.length },
+        });
+        return 'manual-review';
+      }
+
+      // Dev/test bypass mode: keep user flow unblocked, but still create and audit cases.
+      await db.collection('user_metadata').doc(userId).set(
+        {
+          verificationStatus: 'processing',
+          identityCollisionCaseId: caseId,
+          identityCollisionBypassed: true,
+        },
+        { merge: true }
+      );
+      await logAuditEvent({
+        actorUid: null,
+        actorType: 'system',
+        action: 'verification_collision_bypassed',
+        entityType: 'user_metadata',
+        entityId: userId,
+        metadata: { source, caseId, candidateCount: candidateUserIds.length },
+      });
+      return 'processing';
+    }
+
+    await db.collection('user_metadata').doc(userId).set(
+      {
+        verificationStatus: 'processing',
+        identityCollisionCaseId: null,
+      },
+      { merge: true }
+    );
+    return 'processing';
   } catch (err) {
-    console.error('❌ Deduplication check failed:', err);
-    return { isDuplicate: false };
+    console.error('❌ Failed to process identity collision flow:', err);
+    return 'processing';
   }
 }
 
@@ -260,61 +456,7 @@ yotiRouter.get('/status', async (req, res) => {
       try {
         const sessionId = data.yotiSessionId;
         const sessionResult = await idvClient.getSession(sessionId);
-        const checks = sessionResult.getChecks();
-        
-        // Check if all checks have completed
-        let allChecksComplete = true;
-        let approved = true;
-        
-        for (const check of checks) {
-          const recommendation = check.getReport()?.getRecommendation()?.getValue();
-          
-          if (!recommendation || recommendation === 'PENDING') {
-            // Check still processing
-            allChecksComplete = false;
-            break;
-          }
-          
-          if (recommendation !== 'APPROVE') {
-            approved = false;
-          }
-        }
-        
-        // Determine status and check for duplicates
-        let newStatus: string;
-        const updatePayload: Record<string, any> = {};
-        
-        if (!allChecksComplete) {
-          newStatus = 'processing';
-          console.log(`[YOTI_STATUS] Still processing: uid=${uid} - checks pending`);
-        } else if (approved) {
-          // COMMENTED OUT: Our custom deduplication logic - Yoti will provide their own solution
-          // Uncomment below when ready to use our hash-based deduplication:
-          // const dedupResult = await checkIdentityDuplication(sessionResult, uid);
-          // if (dedupResult.isDuplicate) {
-          //   newStatus = 'locked';
-          //   updatePayload.identityDuplicate = true;
-          //   console.log(`[YOTI_STATUS] 🔒 DUPLICATE DETECTED - Account locked: uid=${uid}`);
-          // } else {
-          //   newStatus = 'approved';
-          //   if (dedupResult.identityHash) {
-          //     updatePayload.identityHash = dedupResult.identityHash;
-          //   }
-          //   console.log(`[YOTI_STATUS] Approved with unique identity: uid=${uid}`);
-          // }
-          
-          // Set to processing - users will proceed through onboarding
-          newStatus = 'processing';
-          console.log(`[YOTI_STATUS] Yoti checks passed → processing: uid=${uid}`);
-        } else {
-          newStatus = 'denied';
-          console.log(`[YOTI_STATUS] Denied (checks failed): uid=${uid}`);
-        }
-        
-        // Update database
-        updatePayload.verificationStatus = newStatus;
-        await db.collection('user_metadata').doc(uid).update(updatePayload);
-        status = newStatus;
+        status = await processSessionResult(uid, sessionResult, 'status_poll');
       } catch (pollErr) {
         console.warn('[YOTI_STATUS] Failed to poll session:', pollErr);
         // Keep existing status on error
@@ -349,6 +491,10 @@ yotiRouter.post('/webhook', async (req, res) => {
     if (topic === 'session_completion') {
       const sessionResult = await idvClient.getSession(session_id);
       const userId = sessionResult.getUserTrackingId();
+      if (!userId) {
+        console.warn('⚠️ No userTrackingId found in session');
+        return res.status(200).json({ ignored: true });
+      }
 
       // Log all available Yoti identifiers for debugging
       console.log('📋 [YOTI] Session Result Properties:', {
@@ -363,55 +509,8 @@ yotiRouter.post('/webhook', async (req, res) => {
           .filter(name => name.startsWith('get'))
       });
 
-      const checks = sessionResult.getChecks();
-      
-      // Check if all checks have completed
-      let allChecksComplete = true;
-      let approved = true;
-
-      for (const check of checks) {
-        const recommendation = check.getReport()?.getRecommendation()?.getValue();
-        
-        if (!recommendation || recommendation === 'PENDING') {
-          // Check still processing
-          allChecksComplete = false;
-          break;
-        }
-        
-        if (recommendation !== 'APPROVE') {
-          approved = false;
-        }
-      }
-
-      // Determine final status
-      let finalStatus: string;
-      if (!allChecksComplete) {
-        finalStatus = 'processing'; // Still being reviewed
-      } else if (approved) {
-        finalStatus = 'processing'; // Passed Yoti, now in our onboarding
-      } else {
-        finalStatus = 'denied'; // Failed checks
-      }
-
-      const update: Record<string, any> = {
-        verificationStatus: finalStatus,
-      };
-      
-      console.log(`📩 Webhook: Session ${session_id} → ${finalStatus} (approved=${approved}, complete=${allChecksComplete})`);
-
-      // COMMENTED OUT: Our custom deduplication logic - Yoti will provide their own solution
-      // Uncomment below when ready to use our hash-based deduplication:
-      // if (approved && allChecksComplete) {
-      //   const dedupResult = await checkIdentityDuplication(sessionResult, userId);
-      //   if (dedupResult.isDuplicate) {
-      //     update.verificationStatus = 'locked';
-      //     update.identityDuplicate = true;
-      //     console.log(`📩 Webhook: 🔒 DUPLICATE DETECTED - Account locked: ${userId}`);
-      //   } else if (dedupResult.identityHash) {
-      //     update.identityHash = dedupResult.identityHash;
-      //     console.log(`📩 Webhook: Unique identity verified for user ${userId}`);
-      //   }
-      // }
+      const finalStatus = await processSessionResult(String(userId), sessionResult, 'webhook');
+      console.log(`📩 Webhook: Session ${session_id} → ${finalStatus}`);
 
       if (userId) {
         // Store encrypted first/last name on users collection when available (best-effort parsing)
@@ -443,8 +542,7 @@ yotiRouter.post('/webhook', async (req, res) => {
           console.warn('⚠️ Failed to extract/store PII from Yoti result:', e);
         }
 
-        await db.collection('user_metadata').doc(userId).update(update);
-        console.log(`✅ Updated verification status for user ${userId}:`, update);
+        console.log(`✅ Updated verification status for user ${userId}: ${finalStatus}`);
       } else {
         console.warn('⚠️ No userTrackingId found in session');
       }

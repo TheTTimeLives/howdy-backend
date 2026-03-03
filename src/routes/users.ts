@@ -130,6 +130,7 @@ usersRouter.get('/me', async (req, res) => {
       matchingIntent: metadata?.matchingIntent ?? null,
       gender: metadata?.gender ?? null,
       genderInterest: metadata?.genderInterest ?? null,
+      isSystemAdmin: metadata?.isSystemAdmin === true,
     });
   } catch (e) {
     console.error('❌ Fetch error:', e);
