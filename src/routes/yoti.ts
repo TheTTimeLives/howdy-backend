@@ -1,6 +1,5 @@
 import express from 'express';
 import * as fs from 'fs';
-import crypto from 'crypto';
 import { db } from '../firebase';
 import { encryptString } from '../utils/pii';
 import { verifyJwt } from '../verifyJwt';
@@ -18,6 +17,7 @@ import {
 } from 'yoti';
 
 // ✅ CommonJS require to bypass missing types
+const { token_sort_ratio } = require('fuzzball');
 const {
   SandboxIDVClientBuilder,
   SandboxRecommendationBuilder,
@@ -48,9 +48,14 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const YOTI_WEBHOOK_URL =
   process.env.YOTI_WEBHOOK_URL ||
   (PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/yoti/webhook` : undefined);
+
 const ENFORCE_ID_COLLISION_REVIEW =
-  String(process.env.ENFORCE_ID_COLLISION_REVIEW ?? 'true').toLowerCase() ===
-  'true';
+  String(process.env.ENFORCE_ID_COLLISION_REVIEW ?? 'true').toLowerCase() === 'true';
+
+/** Dev only: create identity_profiles whenever we can extract identity,
+ *  even if user ends up processing/denied. Useful for testing collision flow without full approval. */
+const DEV_CREATE_IDENTITY_ON_ANY_VERIFICATION =
+  String(process.env.DEV_CREATE_IDENTITY_ON_ANY_VERIFICATION ?? 'false').toLowerCase() === 'true';
 
 if (isSandbox) {
   // 🔁 Redirect all IDVClient traffic to sandbox API
@@ -70,72 +75,148 @@ const idvClient = new IDVClient(YOTI_CLIENT_SDK_ID, YOTI_KEY, {
 
 // 🔐 Secure Router
 export const yotiRouter = express.Router();
-yotiRouter.use(verifyJwt);
+yotiRouter.use((req, res, next) => {
+  // Webhook uses Basic auth from Yoti, not JWT
+  if (req.path === '/webhook' && req.method === 'POST') return next();
+  return verifyJwt(req, res, next);
+});
 
-function normalizeName(value: string): string {
-  return value
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-zA-Z\s'-]/g, ' ')
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
+// COMMENTED OUT: Custom deduplication logic (not currently in use)
+// Waiting for Yoti's built-in identity tracking solution
+// This function creates a hash from name+DOB and checks for duplicates in Firestore
+// Uncomment the calls to this function when ready to enable our deduplication
+async function checkIdentityDuplication(sessionResult: any, userId: string): Promise<{ isDuplicate: boolean; identityHash?: string }> {
+  try {
+    const textChecks = sessionResult.getIdDocumentTextDataChecks();
+    if (textChecks.length === 0) {
+      console.warn('⚠️ No ID document text checks found for deduplication');
+      return { isDuplicate: false };
+    }
+
+    const check = textChecks[0];
+    const fields = (check as any).getDocumentFields?.();
+
+    if (!fields) {
+      console.warn('⚠️ No document fields found');
+      return { isDuplicate: false };
+    }
+
+    const fullName = fields.getField('full_name')?.getValue();
+    const dob = fields.getField('date_of_birth')?.getValue();
+
+    if (!fullName || !dob) {
+      console.warn('⚠️ Missing identity fields (name or dob)');
+      return { isDuplicate: false };
+    }
+
+    // Create unique identity hash using ONLY name + DOB
+    // This prevents bypass via different document types (passport vs ID)
+    const rawString = `${fullName}|${dob}`;
+    const crypto = await import('crypto');
+    const hash = crypto.createHash('sha256').update(rawString).digest('hex');
+
+    // Check for existing identity (exclude current user)
+    const existing = await db
+      .collection('user_metadata')
+      .where('identityHash', '==', hash)
+      .get();
+
+    const duplicateExists = !existing.empty && existing.docs.some(doc => doc.id !== userId);
+
+    if (duplicateExists) {
+      console.warn(`⚠️ Duplicate identity detected: ${fullName}, hash: ${hash.substring(0, 16)}...`);
+      return { isDuplicate: true, identityHash: hash };
+    }
+
+    return { isDuplicate: false, identityHash: hash };
+  } catch (err) {
+    console.error('❌ Deduplication check failed:', err);
+    return { isDuplicate: false };
+  }
 }
 
-function normalizeDob(value: string): string | null {
-  const v = String(value || '').trim();
-  if (!v) return null;
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
-
-  const m = v.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$/);
-  if (!m) return null;
-  const month = Number(m[1]);
-  const day = Number(m[2]);
-  const yy = Number(m[3]);
-  const year = yy < 100 ? (yy >= 50 ? 1900 + yy : 2000 + yy) : yy;
-  if (month < 1 || month > 12 || day < 1 || day > 31 || year < 1900) return null;
-  const mm = String(month).padStart(2, '0');
-  const dd = String(day).padStart(2, '0');
-  return `${year}-${mm}-${dd}`;
-}
-
+// --- Identity collision flow (name+DOB block keys) ---
+// Extracts full_name and date_of_birth from Yoti session result.
+// Sandbox and production must return the same structure per Yoti docs:
+// https://developers.yoti.com/identity-verification/retrieve-userdata
 function extractIdentity(sessionResult: any): { fullNameNorm: string; dobNorm: string; first: string; last: string } | null {
-  const textChecks = sessionResult.getIdDocumentTextDataChecks?.() || [];
-  if (!Array.isArray(textChecks) || textChecks.length === 0) return null;
+  const parse = (fullName: string, dob: string) => {
+    if (!fullName || !dob || typeof fullName !== 'string' || typeof dob !== 'string') return null;
+    const fullNameNorm = fullName.trim().toLowerCase().replace(/\s+/g, ' ');
+    const dobNorm = dob.replace(/\D/g, '').slice(0, 8) || dob;
+    const parts = fullName.trim().split(/\s+/);
+    const first = parts[0] || '';
+    const last = parts.length > 1 ? parts.slice(1).join(' ') : '';
+    return { fullNameNorm, dobNorm, first, last };
+  };
 
-  const check = textChecks[0];
-  const fields = (check as any).getDocumentFields?.();
-  if (!fields) return null;
+  const tryFields = (fields: any): ReturnType<typeof parse> => {
+    if (!fields) return null;
+    const fullName = typeof fields.getField === 'function'
+      ? fields.getField('full_name')?.getValue?.()
+      : fields.full_name;
+    const dob = typeof fields.getField === 'function'
+      ? fields.getField('date_of_birth')?.getValue?.()
+      : fields.date_of_birth;
+    return parse(fullName, dob);
+  };
 
-  const fullNameRaw = String(fields.getField('full_name')?.getValue?.() || '').trim();
-  const dobRaw = String(fields.getField('date_of_birth')?.getValue?.() || '').trim();
-  if (!fullNameRaw || !dobRaw) return null;
+  try {
+    // Path 1: getResources().getIdDocuments()[].getDocumentFields() — canonical IDV API
+    const resources = sessionResult.getResources?.();
+    const idDocs = resources?.getIdDocuments?.();
+    if (idDocs?.length > 0) {
+      const doc = idDocs[0];
+      const docFields = doc.getDocumentFields?.();
+      const out = tryFields(docFields);
+      if (out) return out;
+    }
 
-  const fullNameNorm = normalizeName(fullNameRaw);
-  const dobNorm = normalizeDob(dobRaw);
-  if (!fullNameNorm || !dobNorm) return null;
+    // Path 2: getTextDataChecks()[].getDocumentFields() — IDV checks API
+    const textDataChecks = sessionResult.getTextDataChecks?.();
+    if (textDataChecks?.length > 0) {
+      const fields = (textDataChecks[0] as any).getDocumentFields?.();
+      const out = tryFields(fields);
+      if (out) return out;
+    }
 
-  const parts = fullNameNorm.split(' ').filter(Boolean);
-  const first = parts[0] || '';
-  const last = parts[parts.length - 1] || '';
-  if (!first || !last) return null;
+    // Path 3: getIdDocumentTextDataChecks() — Doc Scan / legacy
+    const textChecks = sessionResult.getIdDocumentTextDataChecks?.();
+    if (textChecks?.length > 0) {
+      const fields = (textChecks[0] as any).getDocumentFields?.();
+      const out = tryFields(fields);
+      if (out) return out;
+    }
 
-  return { fullNameNorm, dobNorm, first, last };
+    // Path 4: Raw JSON (e.g. if SDK returns plain object or different shape)
+    const json = JSON.stringify(sessionResult);
+    const fullNameMatch = json.match(/"full_name"\s*:\s*"([^"]+)"/);
+    const dobMatch = json.match(/"date_of_birth"\s*:\s*"([^"]+)"/);
+    if (fullNameMatch && dobMatch) {
+      const out = parse(fullNameMatch[1], dobMatch[1]);
+      if (out) {
+        console.log('[YOTI] extractIdentity: resolved via raw JSON scan');
+        return out;
+      }
+    }
+  } catch (e) {
+    console.warn('[YOTI] extractIdentity error:', e);
+  }
+
+  // Log available methods when extraction fails (helps align sandbox with production)
+  const methods = typeof sessionResult === 'object' && sessionResult !== null
+    ? Object.getOwnPropertyNames(Object.getPrototypeOf(sessionResult)).filter((m: string) => m.startsWith('get'))
+    : [];
+  console.warn('[YOTI] extractIdentity: no identity found. Session methods:', methods.slice(0, 20).join(', '));
+  return null;
 }
 
-function makeBlockHashes(identity: { fullNameNorm: string; dobNorm: string; first: string; last: string }): string[] {
-  const firstInitial = identity.first.charAt(0);
-  const keys = [
-    `dob=${identity.dobNorm}|first=${identity.first}|last=${identity.last}`,
-    `dob=${identity.dobNorm}|last=${identity.last}|fi=${firstInitial}`,
-    `dob=${identity.dobNorm}|name=${identity.fullNameNorm}`,
-  ];
-  return keys.map((key) => crypto.createHash('sha256').update(key).digest('hex'));
-}
+/** Fuzzy similarity thresholds (0-100). Over 70% on both name and DOB → collision (processing, pending admin review). */
+const NAME_SIMILARITY_THRESHOLD = 70;
+const DOB_SIMILARITY_THRESHOLD = 70;
 
 function evaluateChecks(sessionResult: any): { allChecksComplete: boolean; approved: boolean } {
-  const checks = sessionResult.getChecks?.() || [];
+  const checks = sessionResult.getChecks?.() ?? [];
   let allChecksComplete = true;
   let approved = true;
   for (const check of checks) {
@@ -149,48 +230,49 @@ function evaluateChecks(sessionResult: any): { allChecksComplete: boolean; appro
   return { allChecksComplete, approved };
 }
 
-async function upsertIdentityAndFindCollisions(userId: string, identity: { fullNameNorm: string; dobNorm: string; first: string; last: string }) {
+async function upsertIdentityAndFindCollisions(
+  userId: string,
+  identity: { fullNameNorm: string; dobNorm: string; first: string; last: string }
+): Promise<{ candidateUserIds: string[] }> {
   const now = Date.now();
-  const hashes = makeBlockHashes(identity);
 
+  // Store plaintext (pending a better secure system). Enables fuzzy collision matching.
   await db.collection('identity_profiles').doc(userId).set(
     {
       userId,
-      fullNameNormEnc: encryptString(identity.fullNameNorm),
-      dobNormEnc: encryptString(identity.dobNorm),
-      fullNameNormHash: crypto.createHash('sha256').update(identity.fullNameNorm).digest('hex'),
-      dobNormHash: crypto.createHash('sha256').update(identity.dobNorm).digest('hex'),
+      fullNameNorm: identity.fullNameNorm,
+      dobNorm: identity.dobNorm,
       updatedAt: now,
       createdAt: now,
     },
     { merge: true }
   );
 
-  for (let i = 0; i < hashes.length; i++) {
-    const keyHash = hashes[i];
-    const docId = `${userId}_${i}_${keyHash.slice(0, 24)}`;
-    await db.collection('identity_block_keys').doc(docId).set(
-      { userId, keyHash, createdAt: now, updatedAt: now },
-      { merge: true }
-    );
-  }
-
+  // Fetch all identity profiles and fuzzy-compare name + DOB
+  const snap = await db.collection('identity_profiles').get();
   const candidateUserIds = new Set<string>();
-  for (const keyHash of hashes) {
-    const snap = await db
-      .collection('identity_block_keys')
-      .where('keyHash', '==', keyHash)
-      .limit(30)
-      .get();
-    for (const doc of snap.docs) {
-      const matchUid = String(doc.data().userId || '');
-      if (matchUid && matchUid !== userId) candidateUserIds.add(matchUid);
+  for (const doc of snap.docs) {
+    const otherUid = doc.id;
+    if (otherUid === userId) continue;
+    const data = doc.data() as { fullNameNorm?: string; dobNorm?: string };
+    const otherName = String(data.fullNameNorm || '');
+    const otherDob = String(data.dobNorm || '');
+    if (!otherName || !otherDob) continue;
+
+    const nameScore = token_sort_ratio(identity.fullNameNorm, otherName);
+    const dobScore = token_sort_ratio(identity.dobNorm, otherDob);
+    if (nameScore >= NAME_SIMILARITY_THRESHOLD && dobScore >= DOB_SIMILARITY_THRESHOLD) {
+      candidateUserIds.add(otherUid);
     }
   }
-  return { hashes, candidateUserIds: Array.from(candidateUserIds) };
+  return { candidateUserIds: Array.from(candidateUserIds) };
 }
 
-async function createOrReuseCollisionCase(userId: string, identity: { fullNameNorm: string; dobNorm: string }, candidateUserIds: string[]) {
+async function createOrReuseCollisionCase(
+  userId: string,
+  identity: { fullNameNorm: string; dobNorm: string },
+  candidateUserIds: string[]
+): Promise<string> {
   const existing = await db
     .collection('identity_collision_cases')
     .where('userId', '==', userId)
@@ -204,9 +286,9 @@ async function createOrReuseCollisionCase(userId: string, identity: { fullNameNo
     userId,
     candidateUserIds,
     status: 'pending_review',
-    collisionType: 'identity_block_key',
-    fullNameNormEnc: encryptString(identity.fullNameNorm),
-    dobNormEnc: encryptString(identity.dobNorm),
+    collisionType: 'identity_fuzzy_match',
+    fullNameNorm: identity.fullNameNorm,
+    dobNorm: identity.dobNorm,
     createdAt: now,
     updatedAt: now,
   });
@@ -223,8 +305,61 @@ async function createOrReuseCollisionCase(userId: string, identity: { fullNameNo
   return ref.id;
 }
 
-async function processSessionResult(userId: string, sessionResult: any, source: 'status_poll' | 'webhook') {
+async function processSessionResult(
+  userId: string,
+  sessionResult: any,
+  source: 'status_poll' | 'webhook'
+): Promise<string> {
   try {
+    // Dev: create identity profile whenever we can extract identity, even if processing/denied
+    if (DEV_CREATE_IDENTITY_ON_ANY_VERIFICATION) {
+      let identity = extractIdentity(sessionResult);
+      // Sandbox often doesn't return document fields in getSession — use fixed fake identity when extraction fails
+      // (Fixed identity = all sandbox users collide, useful for testing collision flow)
+      if (!identity && isSandbox) {
+        identity = {
+          fullNameNorm: 'jane test',
+          dobNorm: '19900101',
+          first: 'jane',
+          last: 'test',
+        };
+        console.log(`[DEV] Sandbox: no identity in session, using fake identity for ${userId}`);
+      }
+      if (identity) {
+        try {
+          const { candidateUserIds } = await upsertIdentityAndFindCollisions(userId, identity);
+          console.log(`[DEV] Created identity profile for ${userId}, candidateUserIds=[${candidateUserIds.join(', ')}] (count=${candidateUserIds.length})`);
+          // Also run collision flow when DEV creates identity (main flow won't reach it if extractIdentity returns null)
+          if (candidateUserIds.length > 0) {
+            const caseId = await createOrReuseCollisionCase(userId, identity, candidateUserIds);
+            if (ENFORCE_ID_COLLISION_REVIEW) {
+              // Stay in processing — denial only when admin explicitly denies. User can proceed with onboarding.
+              await db.collection('user_metadata').doc(userId).set(
+                {
+                  verificationStatus: 'processing',
+                  identityCollisionCaseId: caseId,
+                  identityCollisionBypassed: false,
+                },
+                { merge: true }
+              );
+              await logAuditEvent({
+                actorUid: null,
+                actorType: 'system',
+                action: 'verification_collision_pending_review',
+                entityType: 'user_metadata',
+                entityId: userId,
+                metadata: { source, reason: 'collision_pending_review', caseId, candidateCount: candidateUserIds.length },
+              });
+              console.log(`[DEV] Collision detected for ${userId} → processing (case ${caseId}, pending admin review)`);
+              return 'processing';
+            }
+          }
+        } catch (e) {
+          console.warn('[DEV] Failed to create identity profile:', e);
+        }
+      }
+    }
+
     const { allChecksComplete, approved } = evaluateChecks(sessionResult);
     if (!allChecksComplete) {
       await db.collection('user_metadata').doc(userId).set(
@@ -245,7 +380,7 @@ async function processSessionResult(userId: string, sessionResult: any, source: 
         action: 'verification_denied',
         entityType: 'user_metadata',
         entityId: userId,
-        metadata: { source },
+        metadata: { source, reason: 'yoti_denied' },
       });
       return 'denied';
     }
@@ -264,9 +399,10 @@ async function processSessionResult(userId: string, sessionResult: any, source: 
     if (candidateUserIds.length > 0) {
       const caseId = await createOrReuseCollisionCase(userId, identity, candidateUserIds);
       if (ENFORCE_ID_COLLISION_REVIEW) {
+        // Stay in processing — denial only when admin explicitly denies. User can proceed with onboarding.
         await db.collection('user_metadata').doc(userId).set(
           {
-            verificationStatus: 'manual-review',
+            verificationStatus: 'processing',
             identityCollisionCaseId: caseId,
             identityCollisionBypassed: false,
           },
@@ -275,15 +411,14 @@ async function processSessionResult(userId: string, sessionResult: any, source: 
         await logAuditEvent({
           actorUid: null,
           actorType: 'system',
-          action: 'verification_manual_review',
+          action: 'verification_collision_pending_review',
           entityType: 'user_metadata',
           entityId: userId,
-          metadata: { source, caseId, candidateCount: candidateUserIds.length },
+          metadata: { source, reason: 'collision_pending_review', caseId, candidateCount: candidateUserIds.length },
         });
-        return 'manual-review';
+        return 'processing';
       }
 
-      // Dev/test bypass mode: keep user flow unblocked, but still create and audit cases.
       await db.collection('user_metadata').doc(userId).set(
         {
           verificationStatus: 'processing',
@@ -298,19 +433,27 @@ async function processSessionResult(userId: string, sessionResult: any, source: 
         action: 'verification_collision_bypassed',
         entityType: 'user_metadata',
         entityId: userId,
-        metadata: { source, caseId, candidateCount: candidateUserIds.length },
+        metadata: { source, reason: 'collision_bypassed', caseId, candidateCount: candidateUserIds.length },
       });
       return 'processing';
     }
 
     await db.collection('user_metadata').doc(userId).set(
       {
-        verificationStatus: 'processing',
+        verificationStatus: 'approved',
         identityCollisionCaseId: null,
       },
       { merge: true }
     );
-    return 'processing';
+    await logAuditEvent({
+      actorUid: null,
+      actorType: 'system',
+      action: 'verification_approved',
+      entityType: 'user_metadata',
+      entityId: userId,
+      metadata: { source, reason: 'yoti_approved' },
+    });
+    return 'approved';
   } catch (err) {
     console.error('❌ Failed to process identity collision flow:', err);
     return 'processing';
@@ -457,6 +600,7 @@ yotiRouter.get('/status', async (req, res) => {
         const sessionId = data.yotiSessionId;
         const sessionResult = await idvClient.getSession(sessionId);
         status = await processSessionResult(uid, sessionResult, 'status_poll');
+        console.log(`[YOTI_STATUS] Poll result: uid=${uid} → ${status}`);
       } catch (pollErr) {
         console.warn('[YOTI_STATUS] Failed to poll session:', pollErr);
         // Keep existing status on error
@@ -491,60 +635,33 @@ yotiRouter.post('/webhook', async (req, res) => {
     if (topic === 'session_completion') {
       const sessionResult = await idvClient.getSession(session_id);
       const userId = sessionResult.getUserTrackingId();
+
       if (!userId) {
         console.warn('⚠️ No userTrackingId found in session');
-        return res.status(200).json({ ignored: true });
+        return res.status(200).json({ ok: true });
       }
-
-      // Log all available Yoti identifiers for debugging
-      console.log('📋 [YOTI] Session Result Properties:', {
-        sessionId: sessionResult.getSessionId?.(),
-        userTrackingId: sessionResult.getUserTrackingId?.(),
-        // Check if Yoti provides any of these (may not exist):
-        subjectId: (sessionResult as any).getSubjectId?.(),
-        deviceId: (sessionResult as any).getDeviceId?.(),
-        identityId: (sessionResult as any).getIdentityId?.(),
-        // Log method names to see what's available:
-        availableMethods: Object.getOwnPropertyNames(Object.getPrototypeOf(sessionResult))
-          .filter(name => name.startsWith('get'))
-      });
 
       const finalStatus = await processSessionResult(String(userId), sessionResult, 'webhook');
       console.log(`📩 Webhook: Session ${session_id} → ${finalStatus}`);
 
-      if (userId) {
-        // Store encrypted first/last name on users collection when available (best-effort parsing)
-        try {
-          const textChecks = sessionResult.getIdDocumentTextDataChecks();
-          if (textChecks.length > 0) {
-            const check = textChecks[0];
-            const fields = (check as any).getDocumentFields?.();
-            let fullName: string | undefined;
-            if (fields) fullName = fields.getField('full_name')?.getValue();
-            if (fullName && typeof fullName === 'string') {
-              const parts = fullName.trim().split(/\s+/);
-              const first = parts[0] || '';
-              const last = parts.length > 1 ? parts.slice(1).join(' ') : '';
-              const firstEnc = first ? encryptString(first) : null;
-              const lastEnc = last ? encryptString(last) : null;
-              if (firstEnc || lastEnc) {
-                await db.collection('users').doc(userId).set({
-                  pii: {
-                    ...(firstEnc ? { firstNameEnc: firstEnc } : {}),
-                    ...(lastEnc ? { lastNameEnc: lastEnc } : {}),
-                    piiVersion: 1,
-                  },
-                }, { merge: true });
-              }
-            }
+      // Store encrypted first/last name on users collection when available (best-effort parsing)
+      try {
+        const identity = extractIdentity(sessionResult);
+        if (identity && (identity.first || identity.last)) {
+          const firstEnc = identity.first ? encryptString(identity.first) : null;
+          const lastEnc = identity.last ? encryptString(identity.last) : null;
+          if (firstEnc || lastEnc) {
+            await db.collection('users').doc(userId).set({
+              pii: {
+                ...(firstEnc ? { firstNameEnc: firstEnc } : {}),
+                ...(lastEnc ? { lastNameEnc: lastEnc } : {}),
+                piiVersion: 1,
+              },
+            }, { merge: true });
           }
-        } catch (e) {
-          console.warn('⚠️ Failed to extract/store PII from Yoti result:', e);
         }
-
-        console.log(`✅ Updated verification status for user ${userId}: ${finalStatus}`);
-      } else {
-        console.warn('⚠️ No userTrackingId found in session');
+      } catch (e) {
+        console.warn('⚠️ Failed to extract/store PII from Yoti result:', e);
       }
 
       return res.status(200).json({ ok: true });

@@ -1,7 +1,21 @@
 import express from 'express';
-import { db } from '../firebase';
+import { db, auth } from '../firebase';
 import { verifyJwt } from '../verifyJwt';
 import { logAuditEvent } from '../utils/audit';
+
+async function getUserDisplayInfo(uid: string): Promise<{ userId: string; email?: string; username?: string }> {
+  const info: { userId: string; email?: string; username?: string } = { userId: uid };
+  try {
+    const [authUser, metaSnap] = await Promise.all([
+      auth.getUser(uid).catch(() => null),
+      db.collection('user_metadata').doc(uid).get(),
+    ]);
+    if (authUser?.email) info.email = authUser.email;
+    const username = metaSnap.data()?.username;
+    if (username) info.username = username;
+  } catch (_) {}
+  return info;
+}
 
 export const adminRouter = express.Router();
 adminRouter.use(verifyJwt);
@@ -107,9 +121,26 @@ adminRouter.get('/id-collisions', async (req, res) => {
       .limit(limit)
       .get();
 
-    const items = snap.docs
+    const rawItems = snap.docs
       .map((d) => ({ id: d.id, ...d.data() }))
       .sort((a, b) => Number((b as any).createdAt || 0) - Number((a as any).createdAt || 0));
+
+    const items = await Promise.all(
+      rawItems.map(async (item: any) => {
+        const userId = String(item.userId || '');
+        const candidateUserIds = (item.candidateUserIds as string[] || []);
+        const [userInfo, ...candidateInfos] = await Promise.all([
+          getUserDisplayInfo(userId),
+          ...candidateUserIds.map((u: string) => getUserDisplayInfo(u)),
+        ]);
+        return {
+          ...item,
+          userInfo,
+          candidateInfos,
+        };
+      })
+    );
+
     return res.status(200).json({ items });
   } catch (e) {
     console.error('❌ Failed to list collision cases:', e);
@@ -150,7 +181,7 @@ adminRouter.post('/id-collisions/:caseId/decision', async (req, res) => {
     );
 
     if (targetUid) {
-      const verificationStatus = decision === 'approve' ? 'processing' : 'denied';
+      const verificationStatus = decision === 'approve' ? 'approved' : 'denied';
       await db.collection('user_metadata').doc(targetUid).set(
         {
           verificationStatus,
@@ -161,13 +192,14 @@ adminRouter.post('/id-collisions/:caseId/decision', async (req, res) => {
       );
     }
 
+    const auditReason = decision === 'approve' ? 'collision_review_approved' : 'collision_review_denied';
     await logAuditEvent({
       actorUid: uid,
       actorType: 'admin',
       action: decision === 'approve' ? 'collision_case_approved' : 'collision_case_denied',
       entityType: 'identity_collision_case',
       entityId: caseId,
-      metadata: { reason, userId: targetUid },
+      metadata: { reason: auditReason, decisionReason: reason, userId: targetUid, reviewedBy: uid },
     });
 
     return res.status(200).json({ ok: true });
