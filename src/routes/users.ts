@@ -1,6 +1,7 @@
 import express from 'express';
 import { db } from '../firebase';
 import { sendVoipNotification } from '../utils/sendVoipNotification';
+import { ensureVirtualNumber, lookupUserByVirtualNumber } from '../utils/virtualNumber';
 import { decryptString } from '../utils/pii';
 import { verifyJwt } from '../verifyJwt';
 import axios from 'axios';
@@ -10,6 +11,7 @@ import path from 'path';
 
 const TENOR_API_KEY = process.env.TENOR_API_KEY;
 const TENOR_CLIENT_KEY = 'howdy-app-123';
+const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@howdy.app';
 
 export const usersRouter = express.Router();
 usersRouter.use(verifyJwt);
@@ -19,11 +21,19 @@ usersRouter.get('/me', async (req, res) => {
 
   try {
     const metadataDoc = await db.collection('user_metadata').doc(uid).get();
+    let metadata = metadataDoc.data();
+    // WIP: Ensure virtual number for Contacts/Favorites integration
+    let virtualNumber: string | undefined = metadata?.virtualNumber;
+    try {
+      virtualNumber = await ensureVirtualNumber(uid);
+    } catch (e) {
+      console.warn('[virtualNumber] ensure failed for', uid, e);
+    }
     if (!metadataDoc.exists) {
       return res.status(404).json({ error: 'User metadata not found' });
     }
 
-    const metadata = metadataDoc.data();
+    metadata = metadataDoc.data();
     const userDoc = await db.collection('users').doc(uid).get();
     const userData = userDoc.data() || {};
     const joinedPoolIds: string[] = metadata?.joinedPools || [];
@@ -108,6 +118,8 @@ usersRouter.get('/me', async (req, res) => {
       gender: metadata?.gender ?? null,
       genderInterest: metadata?.genderInterest ?? null,
       isSystemAdmin: metadata?.isSystemAdmin === true,
+      supportEmail: SUPPORT_EMAIL,
+      virtualNumber: virtualNumber ?? null,
     });
   } catch (e) {
     console.error('❌ Fetch error:', e);
@@ -329,6 +341,21 @@ usersRouter.post('/metadata', async (req, res) => {
   }
 });
 
+// GET /users/by-virtual-number?number=+888... - Lookup user by virtual number (for call routing)
+usersRouter.get('/by-virtual-number', async (req, res) => {
+  const number = String(req.query.number || '').trim();
+  if (!number) return res.status(400).json({ error: 'Missing number' });
+
+  try {
+    const result = await lookupUserByVirtualNumber(number);
+    if (!result) return res.status(404).json({ error: 'Not found' });
+    return res.status(200).json({ userId: result.userId, username: result.username ?? null });
+  } catch (e) {
+    console.error('❌ by-virtual-number lookup failed:', e);
+    return res.status(500).json({ error: 'Lookup failed' });
+  }
+});
+
 usersRouter.get('/:uid', async (req, res) => {
   const { uid } = req.params;
 
@@ -336,7 +363,15 @@ usersRouter.get('/:uid', async (req, res) => {
     const doc = await db.collection('user_metadata').doc(uid).get();
     if (!doc.exists) return res.status(404).json({ error: 'Not found' });
 
-    return res.status(200).json(doc.data());
+    const data = doc.data() || {};
+    // WIP: Ensure virtual number for Contacts/Favorites (needed when fetching partner for call)
+    try {
+      const vn = await ensureVirtualNumber(uid);
+      data.virtualNumber = vn;
+    } catch (e) {
+      console.warn(`⚠️ [GET /users/${uid}] ensureVirtualNumber failed - virtualNumber omitted:`, e);
+    }
+    return res.status(200).json(data);
   } catch (e) {
     console.error(`❌ Failed to fetch metadata for ${uid}:`, e);
     return res.status(500).json({ error: 'Failed to load user metadata' });

@@ -2,6 +2,7 @@ import express from 'express';
 import { verifyJwt } from '../verifyJwt';
 import { db } from '../firebase';
 import { sendVoipNotification } from '../utils/sendVoipNotification';
+import { ensureVirtualNumber } from '../utils/virtualNumber';
 
 export const scheduledCallRouter = express.Router();
 scheduledCallRouter.use(verifyJwt);
@@ -58,6 +59,14 @@ scheduledCallRouter.post('/call', async (req, res) => {
     const userDoc = await db.collection('user_metadata').doc(uid).get();
     const username = userDoc.data()?.username ?? 'Anonymous';
 
+    let callerVirtualNumber: string | null = null;
+    try {
+      callerVirtualNumber = await ensureVirtualNumber(uid);
+      console.log('✅ [SCHEDULED_CALL] callerVirtualNumber:', callerVirtualNumber);
+    } catch (e) {
+      console.warn('⚠️ [SCHEDULED_CALL] Failed to get caller virtual number - Recents will show howdy:user:id:', e);
+    }
+
     console.log('👤 Caller username resolved:', username);
 
     await sendVoipNotification(partnerId, {
@@ -68,6 +77,7 @@ scheduledCallRouter.post('/call', async (req, res) => {
         channelName,
         callerId: uid,
         callerName: username,
+        ...(callerVirtualNumber ? { callerVirtualNumber } : {}),
       },
     });
 

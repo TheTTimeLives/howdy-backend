@@ -7,10 +7,16 @@ matchQueueRouter.use(verifyJwt);
 
 matchQueueRouter.get('/:uid', async (req, res) => {
   const { uid } = req.params;
+  const callerUid = (req as any).uid;
 
   try {
     const doc = await db.collection('matchQueue').doc(uid).get();
-    if (!doc.exists) return res.status(404).json({ error: 'Not in queue' });
+    if (!doc.exists) {
+      if (uid === callerUid) {
+        console.log(`📭 [MATCH_QUEUE] GET uid=${uid} → 404 (doc not found, caller=${callerUid})`);
+      }
+      return res.status(404).json({ error: 'Not in queue' });
+    }
 
     return res.json(doc.data());
   } catch (error) {

@@ -7,6 +7,7 @@ import { sendEmail } from '../utils/email';
 import { authenticator, totp } from 'otplib';
 import { verifyJwt, clearSessionCache } from '../verifyJwt';
 import { db, auth } from '../firebase';
+import { ensureVirtualNumber } from '../utils/virtualNumber';
 
 export const authRouter = express.Router();
 
@@ -97,6 +98,12 @@ authRouter.post('/signup-invite', async (req, res) => {
       primaryGroupId: inv.groupId,
     }, { merge: true });
 
+    try {
+      await ensureVirtualNumber(uid);
+    } catch (e) {
+      console.warn('[signup-invite] virtualNumber assign failed:', e);
+    }
+
     // accept invite: add to group members (store membership keyed by uid for consistency)
     const membersCol = db.collection('groups').doc(inv.groupId).collection('members');
     await membersCol.doc(uid).set({
@@ -162,6 +169,12 @@ authRouter.post('/accept-member-invite', async (req, res) => {
       accountType: 'member',
       primaryGroupId: String(invite.groupId),
     }, { merge: true });
+
+    try {
+      await ensureVirtualNumber(uid);
+    } catch (e) {
+      console.warn('[accept-member-invite] virtualNumber assign failed:', e);
+    }
 
     // Add/activate membership keyed by uid
     const membersCol = db.collection('groups').doc(String(invite.groupId)).collection('members');
@@ -427,6 +440,12 @@ authRouter.post('/signup', async (req, res) => {
       }, { merge: true });
     } else {
       // 'individual' – nothing extra to do
+    }
+
+    try {
+      await ensureVirtualNumber(userId);
+    } catch (e) {
+      console.warn('[signup] virtualNumber assign failed:', e);
     }
 
     const sid = crypto.randomUUID();
