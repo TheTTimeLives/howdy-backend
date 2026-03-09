@@ -57,7 +57,9 @@ scheduledCallRouter.post('/call', async (req, res) => {
 
   try {
     const userDoc = await db.collection('user_metadata').doc(uid).get();
-    const username = userDoc.data()?.username ?? 'Anonymous';
+    const userData = userDoc.data();
+    const username = userData?.username ?? 'Anonymous';
+    const callerPhotoUrl = userData?.photoUrl ?? null;
 
     let callerVirtualNumber: string | null = null;
     try {
@@ -78,6 +80,7 @@ scheduledCallRouter.post('/call', async (req, res) => {
         callerId: uid,
         callerName: username,
         ...(callerVirtualNumber ? { callerVirtualNumber } : {}),
+        ...(callerPhotoUrl ? { callerPhotoUrl } : {}),
       },
     });
 

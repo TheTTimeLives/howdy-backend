@@ -162,7 +162,7 @@ usersRouter.post('/preferences', async (req, res) => {
 
 usersRouter.get('/tenor/search', async (req, res) => {
   console.log('🔍 Tenor search request:', req.query);
-  const { q, limit } = req.query;
+  const { q, limit, pos } = req.query;
 
   if (!q || typeof q !== 'string') {
     return res.status(400).json({ error: 'Missing or invalid query param "q"' });
@@ -174,15 +174,21 @@ usersRouter.get('/tenor/search', async (req, res) => {
   }
 
   try {
+    const limitNum = typeof limit === 'string' ? parseInt(limit, 10) : typeof limit === 'number' ? limit : 15;
+    const params: Record<string, string | number> = {
+      key: TENOR_API_KEY,
+      client_key: TENOR_CLIENT_KEY,
+      q,
+      limit: limitNum || 15,
+      media_filter: 'minimal',
+      contentfilter: 'medium',
+    };
+    if (pos && typeof pos === 'string') {
+      params.pos = pos;
+    }
+
     const r = await axios.get('https://tenor.googleapis.com/v2/search', {
-      params: {
-        key: TENOR_API_KEY,
-        client_key: TENOR_CLIENT_KEY,
-        q,
-        limit: limit || 15,
-        media_filter: 'minimal',
-        contentfilter: 'medium',
-      },
+      params,
     });
 
     const gifs = r.data.results.map((result: any) =>
@@ -190,8 +196,9 @@ usersRouter.get('/tenor/search', async (req, res) => {
       result?.media_formats?.tinygifpreview?.url
     ).filter((url: string | null) => !!url);
 
-    console.log('🔍 Tenor search response:', { gifs });
-    res.status(200).json({ gifs });
+    const next = r.data.next ?? null;
+
+    res.status(200).json({ gifs, next });
   } catch (e) {
     console.error('❌ Tenor search failed:', e);
     res.status(500).json({ error: 'Tenor search failed' });
