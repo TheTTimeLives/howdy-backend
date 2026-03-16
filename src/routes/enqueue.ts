@@ -27,7 +27,7 @@ enqueueRouter.get('/status', async (req, res) => {
 
 enqueueRouter.post('/', async (req, res) => {
   const uid = (req as any).uid;
-  const { prefs } = req.body;
+  const { prefs, scheduled, scheduledWindowEnd } = req.body;
 
   if (!prefs || typeof prefs !== 'object') {
     return res.status(400).json({ error: 'Missing or invalid prefs object' });
@@ -48,14 +48,21 @@ enqueueRouter.post('/', async (req, res) => {
       });
     }
 
-    await db.collection('matchQueue').doc(uid).set({
+    const isScheduled = scheduled === true && typeof scheduledWindowEnd === 'number';
+    const queueData: Record<string, unknown> = {
       prefs,
-      topic: prefs.topic || null, // ✅ Save optional topic
+      topic: prefs.topic || null,
       timestamp: Date.now(),
       state: 'searching',
-    });
+    };
+    if (isScheduled) {
+      queueData.scheduled = true;
+      queueData.scheduledWindowEnd = scheduledWindowEnd;
+    }
 
-    console.log(`📥 [ENQUEUE] uid=${uid} added to matchQueue (searching)`);
+    await db.collection('matchQueue').doc(uid).set(queueData);
+
+    console.log(`📥 [ENQUEUE] uid=${uid} added to matchQueue (searching)${isScheduled ? ' [scheduled]' : ''}`);
 
     await matchUsers(); // ✅ now runs matchmaking after enqueue
 

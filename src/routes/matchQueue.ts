@@ -18,6 +18,11 @@ matchQueueRouter.get('/:uid', async (req, res) => {
       return res.status(404).json({ error: 'Not in queue' });
     }
 
+    // Heartbeat: update lastPolledAt when caller polls their own doc
+    if (uid === callerUid) {
+      doc.ref.update({ lastPolledAt: Date.now() }).catch(() => {});
+    }
+
     return res.json(doc.data());
   } catch (error) {
     console.error('Failed to get match status:', error);

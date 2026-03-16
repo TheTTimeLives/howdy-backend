@@ -250,10 +250,16 @@ try {
   cron2.schedule('*/1 * * * *', async () => {
     try {
       const { db } = await import('./firebase');
-      const cutoffPending = Date.now() - 60_000; // 60s for match-pending
-      const cutoffAccepted = Date.now() - 120_000; // 120s for match-accepted-pending
+      const now = Date.now();
+      const cutoffPending = now - 60_000; // 60s for match-pending
+      const cutoffAccepted = now - 120_000; // 120s for match-accepted-pending
+      const staleCutoff = now - 10 * 60 * 1000; // 10 min for stale searching/waiting-for-rematch
+      const orphanedCutoff = now - 5 * 60 * 1000; // 5 min for orphaned pairs
 
-      const pendingSnap = await db.collection('matchQueue')
+      const queueRef = db.collection('matchQueue');
+
+      // 1. TTL: match-pending (no accept) older than 60s → reset to searching
+      const pendingSnap = await queueRef
         .where('state', '==', 'match-pending')
         .where('accepted', '==', false)
         .where('timestamp', '<', cutoffPending)
@@ -265,11 +271,12 @@ try {
           partnerId: null,
           channelName: null,
           accepted: false,
-          timestamp: Date.now(),
+          timestamp: now,
         });
       }
 
-      const acceptedSnap = await db.collection('matchQueue')
+      // 2. TTL: match-accepted-pending older than 120s → reset to searching
+      const acceptedSnap = await queueRef
         .where('state', '==', 'match-accepted-pending')
         .where('timestamp', '<', cutoffAccepted)
         .get();
@@ -280,8 +287,78 @@ try {
           partnerId: null,
           channelName: null,
           accepted: false,
-          timestamp: Date.now(),
+          timestamp: now,
         });
+      }
+
+      // 3. Stale cleanup: remove searching/waiting-for-rematch with no poll in 10 min
+      // Skip scheduled users still in their window (cron won't wipe them)
+      const staleSnap = await queueRef
+        .where('state', 'in', ['searching', 'waiting-for-rematch'])
+        .limit(500)
+        .get();
+
+      let staleCount = 0;
+      for (const doc of staleSnap.docs) {
+        const data = doc.data() || {};
+        if (data.scheduled === true && Number(data.scheduledWindowEnd || 0) > now) {
+          continue; // In scheduled window, don't remove
+        }
+        const lastActivity = data.lastPolledAt ?? data.timestamp ?? 0;
+        if (lastActivity < staleCutoff) {
+          await doc.ref.delete();
+          staleCount++;
+        }
+      }
+      if (staleCount > 0) {
+        console.log(`🧹 Removed ${staleCount} stale matchQueue entries (no poll in 10 min)`);
+      }
+
+      // 4. Orphaned pair cleanup: match-pending/pending-accepted where one side hasn't polled in 5 min
+      const pairSnap = await queueRef
+        .where('state', 'in', ['match-pending', 'match-accepted-pending'])
+        .get();
+
+      const processedPairs = new Set<string>();
+      for (const doc of pairSnap.docs) {
+        const uid = doc.id;
+        const data = doc.data() || {};
+        const partnerId = String(data.partnerId || '').trim();
+        if (!partnerId) continue;
+
+        const pairKey = [uid, partnerId].sort().join('|');
+        if (processedPairs.has(pairKey)) continue;
+        processedPairs.add(pairKey);
+
+        const lastActivity = data.lastPolledAt ?? data.timestamp ?? 0;
+        const partnerDoc = await queueRef.doc(partnerId).get();
+        const partnerData = partnerDoc.exists ? (partnerDoc.data() || {}) : {};
+        const partnerLastActivity = partnerData.lastPolledAt ?? partnerData.timestamp ?? 0;
+
+        if (lastActivity < orphanedCutoff || partnerLastActivity < orphanedCutoff) {
+          const updates: Promise<unknown>[] = [
+            doc.ref.update({
+              state: 'searching',
+              partnerId: null,
+              channelName: null,
+              accepted: false,
+              pendingExpiresAt: null,
+              timestamp: now,
+            }),
+          ];
+          if (partnerDoc.exists) {
+            updates.push(partnerDoc.ref.update({
+              state: 'searching',
+              partnerId: null,
+              channelName: null,
+              accepted: false,
+              pendingExpiresAt: null,
+              timestamp: now,
+            }));
+          }
+          await Promise.all(updates);
+          console.log(`🧹 Reset orphaned pair: ${uid} and ${partnerId} (no poll in 5 min)`);
+        }
       }
 
       // Run matchmaker to check for rematch timeouts and make new matches

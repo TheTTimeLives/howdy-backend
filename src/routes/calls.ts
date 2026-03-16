@@ -172,6 +172,56 @@ function buildRecorderToken(channelName: string) {
   return { token, expiresAt: expireTs * 1000 };
 }
 
+// ========= Call history (server-side read; bypasses Firestore rules) =========
+callsRouter.get('/history', async (req, res) => {
+  try {
+    const uid = String((req as any).uid || '').trim();
+    if (!uid) return res.status(401).json({ error: 'Unauthorized' });
+
+    const limit = Math.min(Number(req.query.limit) || 50, 100);
+    let targetUid = uid;
+    const queryUid = String(req.query.uid || '').trim();
+    if (queryUid && queryUid !== uid) {
+      const meta = await db.collection('user_metadata').doc(uid).get();
+      const isAdmin = meta.data()?.isSystemAdmin === true;
+      if (isAdmin) targetUid = queryUid;
+    }
+
+    const snap = await db
+      .collection('users')
+      .doc(targetUid)
+      .collection('user-metadata')
+      .doc('history')
+      .collection('calls')
+      .orderBy('timestamp', 'desc')
+      .limit(limit)
+      .get();
+
+    const calls: any[] = [];
+    for (const doc of snap.docs) {
+      const data = doc.data() || {};
+      const partnerId = String(data.partnerId || '').trim();
+      let partnerUsername = partnerId;
+      if (partnerId) {
+        try {
+          const meta = await db.collection('user_metadata').doc(partnerId).get();
+          partnerUsername = String(meta.data()?.username || partnerId).trim() || partnerId;
+        } catch (_) {}
+      }
+      calls.push({
+        ...data,
+        docId: doc.id,
+        partnerUsername,
+      });
+    }
+
+    return res.json({ calls });
+  } catch (e) {
+    console.error('❌ /calls/history error', e);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+});
+
 // ========= Call lifecycle =========
 callsRouter.post('/start', async (req, res) => {
   try {

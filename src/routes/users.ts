@@ -105,6 +105,7 @@ usersRouter.get('/me', async (req, res) => {
       unmanagedDeleteAt: metadata?.unmanagedSince ? Number(metadata?.unmanagedSince) + (7 * 24 * 60 * 60 * 1000) : null,
       themeMode: metadata?.themeMode ?? null,
       textScale: metadata?.textScale ?? null,
+      ttsVoiceId: metadata?.ttsVoiceId ?? null,
       currentPrompt: metadata?.currentPrompt ?? null,
       ui: metadata?.ui ?? null,
       mfa: metadata?.mfa ? {
@@ -208,7 +209,7 @@ usersRouter.get('/tenor/search', async (req, res) => {
 
 usersRouter.post('/metadata', async (req, res) => {
   const uid = (req as any).uid;
-  const { username, photoUrl, bioResponses, onboardingStage, themeMode, textScale, currentPrompt, connectOutsidePreferences } = req.body;
+  const { username, photoUrl, bioResponses, onboardingStage, themeMode, textScale, currentPrompt, connectOutsidePreferences, groupCodes, ttsVoiceId } = req.body;
 
 // Check individual fields before merging
 const updatePayload: any = {};
@@ -216,10 +217,12 @@ if (username) updatePayload.username = username;
 if (photoUrl) updatePayload.photoUrl = photoUrl;
 if (bioResponses) updatePayload.bioResponses = bioResponses;
 if (onboardingStage) updatePayload.onboardingStage = onboardingStage;
- if (themeMode) updatePayload.themeMode = themeMode;
- if (typeof textScale === 'number') updatePayload.textScale = textScale;
- if (typeof currentPrompt === 'string') updatePayload.currentPrompt = currentPrompt;
- if (typeof connectOutsidePreferences === 'boolean') updatePayload.connectOutsidePreferences = connectOutsidePreferences;
+if (themeMode) updatePayload.themeMode = themeMode;
+if (typeof textScale === 'number') updatePayload.textScale = textScale;
+if (typeof currentPrompt === 'string') updatePayload.currentPrompt = currentPrompt;
+if (typeof connectOutsidePreferences === 'boolean') updatePayload.connectOutsidePreferences = connectOutsidePreferences;
+if (Array.isArray(groupCodes)) updatePayload.groupCodes = groupCodes;
+if (typeof ttsVoiceId === 'string' && ttsVoiceId.trim()) updatePayload.ttsVoiceId = ttsVoiceId.trim();
 
 try {
   await db.collection('user_metadata').doc(uid).set(updatePayload, { merge: true });
