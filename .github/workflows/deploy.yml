@@ -1,6 +1,7 @@
 name: Deploy Backend
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - '**'
@@ -42,6 +43,15 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Check Artifact Registry region
+        run: |
+          R="${{ secrets.GCP_RUN_REGION }}"
+          if [ -z "$R" ]; then
+            echo "::error::GCP_RUN_REGION is empty. Add it to the workflow environment (e.g. dev) or repo secrets — value like us-central1 (no suffix)."
+            exit 1
+          fi
+          echo "GCP_RUN_REGION=$R"
 
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ secrets.GCP_RUN_REGION }}-docker.pkg.dev -q
