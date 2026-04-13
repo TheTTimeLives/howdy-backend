@@ -44,24 +44,36 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Check Artifact Registry region
+      - name: Check Artifact Registry region and project
         run: |
           R="${{ secrets.GCP_RUN_REGION }}"
+          R="${R%-docker.pkg.dev}"
           if [ -z "$R" ]; then
             echo "::error::GCP_RUN_REGION is empty. Add it to the workflow environment (e.g. dev) or repo secrets — value like us-central1 (no suffix)."
             exit 1
           fi
+          P="${{ secrets.GCP_PROJECT_ID }}"
+          if [ -z "$P" ]; then P="${GOOGLE_CLOUD_PROJECT:-}"; fi
+          if [ -z "$P" ]; then
+            echo "::error::GCP_PROJECT_ID is empty and GOOGLE_CLOUD_PROJECT is unset. Add secret GCP_PROJECT_ID (e.g. howdy-app-123) to the dev environment or repo."
+            exit 1
+          fi
           echo "GCP_RUN_REGION=$R"
+          echo "GCP_PROJECT_ID=$P"
+          {
+            echo "GCP_RUN_REGION_NORM=$R"
+            echo "GCP_PROJECT_RESOLVED=$P"
+          } >> "$GITHUB_ENV"
 
       - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ secrets.GCP_RUN_REGION }}-docker.pkg.dev -q
+        run: gcloud auth configure-docker "${GCP_RUN_REGION_NORM}-docker.pkg.dev" -q
 
       - name: Compute image name
         id: meta
         run: |
           REPO="${{ secrets.GCP_ARTIFACT_REPOSITORY }}"
           if [ -z "$REPO" ]; then REPO="howdy"; fi
-          IMAGE="${{ secrets.GCP_RUN_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/$REPO/howdy-backend:${{ github.sha }}"
+          IMAGE="${GCP_RUN_REGION_NORM}-docker.pkg.dev/${GCP_PROJECT_RESOLVED}/$REPO/howdy-backend:${{ github.sha }}"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
       - name: Build container
@@ -73,7 +85,7 @@ jobs:
       - name: Deploy to Cloud Run
         env:
           SERVICE: ${{ secrets.GCP_RUN_SERVICE }}
-          REGION: ${{ secrets.GCP_RUN_REGION }}
+          REGION: ${{ env.GCP_RUN_REGION_NORM }}
           IMAGE: ${{ steps.meta.outputs.image }}
           # Runtime env (optional, set in repo/env secrets)
           NODE_ENV: production
@@ -103,7 +115,7 @@ jobs:
           set -euo pipefail
           svc="${SERVICE:-howdy-backend}"
           if [ -z "${REGION:-}" ]; then
-            echo "GCP_RUN_REGION secret is required"; exit 1
+            echo "GCP_RUN_REGION_NORM is unset (check GCP_RUN_REGION secret)"; exit 1
           fi
           # Build env list dynamically (include only non-empty)
           ENV_LIST="NODE_ENV=production"
