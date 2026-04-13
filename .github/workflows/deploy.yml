@@ -20,6 +20,7 @@ jobs:
   deploy:
     name: Deploy to Cloud Run
     runs-on: ubuntu-24.04
+    environment: dev
     defaults:
       run:
         working-directory: .
