@@ -1,6 +1,7 @@
 import express from 'express';
 import { db } from '../firebase';
 import { verifyJwt } from '../verifyJwt';
+import { canManageAvailabilityFor } from '../utils/scheduleAuth';
 
 export const availabilityRouter = express.Router();
 availabilityRouter.use(express.json());
@@ -25,6 +26,22 @@ function nextWeeklyStart(base: Date, clock: Date): Date {
   const diff = clockMs - baseMs;
   const weeksToSkip = Math.ceil(diff / weekMs);
   return new Date(baseMs + weeksToSkip * weekMs);
+}
+
+function overlapsValidWindow(
+  slotStart: number,
+  slotEnd: number,
+  validFrom: unknown,
+  validTo: unknown,
+): boolean {
+  const vf = validFrom != null && validFrom !== '' ? Number(validFrom) : null;
+  const vt = validTo != null && validTo !== '' ? Number(validTo) : null;
+  if ((vf == null || !Number.isFinite(vf)) && (vt == null || !Number.isFinite(vt))) {
+    return true;
+  }
+  if (vf != null && Number.isFinite(vf) && slotEnd <= vf) return false;
+  if (vt != null && Number.isFinite(vt) && slotStart > vt) return false;
+  return true;
 }
 
 function nextMonthlyStart(base: Date, clock: Date): Date {
@@ -111,6 +128,10 @@ availabilityRouter.get('/upcoming', async (req, res) => {
         continue;
       }
 
+      if (!overlapsValidWindow(slotStart, slotEnd, it.validFrom, it.validTo)) {
+        continue;
+      }
+
       if (slotStart <= horizon.getTime()) {
         const key = `${typ}-${slotStart}-${slotEnd}`;
         if (!seenSlots.has(key)) {
@@ -136,8 +157,9 @@ availabilityRouter.get('/upcoming', async (req, res) => {
 
 // POST /availability
 // Body can represent single entry or weekly across a date range.
+// Optional scheduleOwnerUid: write to that user's schedule (staff managing member only).
 availabilityRouter.post('/', async (req, res) => {
-  const uid = (req as any).uid as string;
+  const requesterUid = (req as any).uid as string;
   try {
     const {
       start, // ms
@@ -147,10 +169,29 @@ availabilityRouter.post('/', async (req, res) => {
       targetUserId, // optional
       dateRangeStart, // ms optional (for weekly bulk)
       dateRangeEnd, // ms optional (for weekly bulk)
+      weekdays, // optional: Dart-style weekday 1=Mon … 7=Sun — limit weekly bulk to these days
+      validFrom, // optional ms: start of first calendar day (repeating window)
+      validTo, // optional ms: end of last calendar day (repeating window, inclusive)
+      scheduleOwnerUid, // optional: defaults to JWT uid
     } = req.body || {};
+
+    const ownerUid =
+      scheduleOwnerUid != null && String(scheduleOwnerUid).trim()
+        ? String(scheduleOwnerUid).trim()
+        : requesterUid;
+
+    if (ownerUid !== requesterUid && !(await canManageAvailabilityFor(requesterUid, ownerUid))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const uid = ownerUid;
 
     const typ = (type || 'scheduled').toString();
     const rpt: RepeatType = repeat ? String(repeat) as RepeatType : null;
+
+    const weeklyValidFrom =
+      validFrom != null ? Number(validFrom) : dateRangeStart != null ? Number(dateRangeStart) : null;
+    const weeklyValidTo = validTo != null ? Number(validTo) : null;
 
     if (rpt === 'weekly' && dateRangeStart && dateRangeEnd) {
       const startDate = new Date(Number(dateRangeStart));
@@ -161,8 +202,25 @@ availabilityRouter.post('/', async (req, res) => {
       const created: string[] = [];
       const daysCreated = new Set<number>(); // Track which days of the week we've already created an entry for
 
+      // Optional filter: weekdays as Dart DateTime.weekday (1=Mon … 7=Sun) → JS getDay() (0=Sun … 6=Sat)
+      let allowedJsDays: Set<number> | null = null;
+      if (Array.isArray(weekdays) && weekdays.length > 0) {
+        allowedJsDays = new Set(
+          weekdays.map((w: any) => {
+            const d = Number(w);
+            if (!Number.isFinite(d)) return -1;
+            // Dart 7 = Sunday → JS 0; Dart 1–6 = JS 1–6
+            return d === 7 ? 0 : d;
+          }).filter((n) => n >= 0 && n <= 6),
+        );
+      }
+
       while (cursor.getTime() <= endDay.getTime()) {
         const dayOfWeek = cursor.getDay();
+        if (allowedJsDays && !allowedJsDays.has(dayOfWeek)) {
+          cursor.setDate(cursor.getDate() + 1);
+          continue;
+        }
         if (!daysCreated.has(dayOfWeek)) {
           const s = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), new Date(Number(start)).getHours(), new Date(Number(start)).getMinutes(), 0, 0);
           const e = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate(), new Date(Number(end)).getHours(), new Date(Number(end)).getMinutes(), 0, 0);
@@ -175,9 +233,11 @@ availabilityRouter.post('/', async (req, res) => {
               end: e.getTime(),
               type: typ,
               repeat: 'weekly',
-              createdBy: uid,
+              createdBy: requesterUid,
               createdAt: Date.now(),
               targetUserId: targetUserId ?? null,
+              validFrom: Number.isFinite(weeklyValidFrom) ? weeklyValidFrom : null,
+              validTo: weeklyValidTo != null && Number.isFinite(weeklyValidTo) ? weeklyValidTo : null,
             });
           created.push(ref.id);
           daysCreated.add(dayOfWeek);
@@ -196,6 +256,9 @@ availabilityRouter.post('/', async (req, res) => {
       return res.status(400).json({ error: 'start and end (ms) required' });
     }
 
+    const singleValidFrom = validFrom != null ? Number(validFrom) : null;
+    const singleValidTo = validTo != null ? Number(validTo) : null;
+
     const ref = await db
       .collection('schedules')
       .doc(uid)
@@ -204,10 +267,22 @@ availabilityRouter.post('/', async (req, res) => {
         start: s,
         end: e,
         type: typ,
-        repeat: rpt,
-        createdBy: uid,
+               repeat: rpt,
+        createdBy: requesterUid,
         createdAt: Date.now(),
         targetUserId: targetUserId ?? null,
+        validFrom:
+          (rpt === 'weekly' || rpt === 'monthly') &&
+          singleValidFrom != null &&
+          Number.isFinite(singleValidFrom)
+            ? singleValidFrom
+            : null,
+        validTo:
+          (rpt === 'weekly' || rpt === 'monthly') &&
+          singleValidTo != null &&
+          Number.isFinite(singleValidTo)
+            ? singleValidTo
+            : null,
       });
     return res.status(200).json({ ok: true, id: ref.id });
   } catch (e) {
@@ -216,12 +291,20 @@ availabilityRouter.post('/', async (req, res) => {
   }
 });
 
-// DELETE /availability/:id
+// DELETE /availability/:id?scheduleOwnerUid= (optional; defaults to JWT user)
 availabilityRouter.delete('/:id', async (req, res) => {
-  const uid = (req as any).uid as string;
+  const requesterUid = (req as any).uid as string;
   const { id } = req.params;
+  const rawOwner =
+    typeof req.query.scheduleOwnerUid === 'string' ? req.query.scheduleOwnerUid.trim() : '';
+  const ownerUid = rawOwner || requesterUid;
+
+  if (ownerUid !== requesterUid && !(await canManageAvailabilityFor(requesterUid, ownerUid))) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
   try {
-    const ref = db.collection('schedules').doc(uid).collection('availability').doc(id);
+    const ref = db.collection('schedules').doc(ownerUid).collection('availability').doc(id);
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ error: 'Not found' });
     await ref.delete();

@@ -8,6 +8,7 @@ import { authenticator, totp } from 'otplib';
 import { verifyJwt, clearSessionCache } from '../verifyJwt';
 import { db, auth } from '../firebase';
 import { ensureVirtualNumber } from '../utils/virtualNumber';
+import { logAuditEvent } from '../utils/audit';
 
 export const authRouter = express.Router();
 
@@ -317,6 +318,17 @@ export async function logLoginEvent(uid: string, req: express.Request, method: s
       sessionId: sid,
       timestamp: Date.now(),
     }).catch(err => console.error('[AUTH] Failed to log login history:', err));
+
+    // 4. Audit log (BACKGROUND)
+    logAuditEvent({
+      actorUid: uid,
+      actorType: 'user',
+      action: 'login',
+      entityType: 'session',
+      entityId: sid,
+      metadata: { method, ip },
+      category: 'auth',
+    }).catch(() => {});
 
     clearSessionCache(uid);
 

@@ -3,6 +3,7 @@ import { db } from '../firebase';
 import { verifyJwt } from '../verifyJwt';
 import { matchUsers } from '../services/matchmaker';
 import { getGoLiveLockStatus } from '../services/behaviorInfractions';
+import { logAuditEvent } from '../utils/audit';
 
 export const enqueueRouter = express.Router();
 enqueueRouter.use(verifyJwt);
@@ -36,6 +37,16 @@ enqueueRouter.post('/', async (req, res) => {
   try {
     const lock = await getGoLiveLockStatus(uid);
     if (lock.isLocked) {
+      logAuditEvent({
+        actorUid: uid,
+        actorType: 'user',
+        action: 'moderation_flagged',
+        entityType: 'enqueue',
+        entityId: uid,
+        metadata: { reason: 'enqueue_lock_active', lockUntil: lock.lockUntil },
+        category: 'moderation',
+      }).catch(() => {});
+
       return res.status(423).json({
         error: 'GO_LIVE_LOCKED',
         lockUntil: lock.lockUntil,

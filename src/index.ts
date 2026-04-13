@@ -22,10 +22,15 @@ import { pushRouter } from './routes/pushRouter';
 import { subscriptionsRouter } from './routes/subscriptions';
 import { billingRouter } from './routes/billing';
 import { onboardingRouter } from './routes/onboarding';
-import { callsRouter, assemblyAiWebhookHandler } from './routes/calls';
+import {
+  callsRouter,
+  assemblyAiWebhookHandler,
+  cloudflareTranscriptionWebhookHandler,
+} from './routes/calls';
 import { devicesRouter, devicesPublicRouter } from './routes/devices';
 import { eventsRouter } from './routes/events';
 import { availabilityRouter } from './routes/availability';
+import { scheduleRouter } from './routes/schedule';
 import { adminRouter } from './routes/admin';
 import { faqRouter } from './routes/faq';
 
@@ -36,6 +41,11 @@ const app = express();
 
 /* ===== Raw-body webhook endpoints (must be before json()) ===== */
 app.post('/webhooks/assemblyai', express.json({ limit: '20mb' }), assemblyAiWebhookHandler);
+app.post(
+  '/webhooks/cloudflare-transcription',
+  express.json({ limit: '20mb' }),
+  cloudflareTranscriptionWebhookHandler
+);
 
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   try {
@@ -222,6 +232,7 @@ app.use('/onboarding', onboardingRouter);
 app.use('/devices', devicesRouter);
 app.use('/events', eventsRouter);
 app.use('/availability', availabilityRouter);
+app.use('/schedule', scheduleRouter);
 app.use('/admin', adminRouter);
 app.use('/faq', faqRouter);
 
@@ -243,6 +254,38 @@ try {
       await runTranscriptBackfillJob();
     });
     console.log('⏰ Transcript backfill cron scheduled for 02:30 daily');
+  }
+
+  // Audit retention: delete system_activity_audit older than AUDIT_RETENTION_DAYS (default 30). Set to 0 to disable.
+  const auditRetentionDays = Math.max(0, parseInt(String(process.env.AUDIT_RETENTION_DAYS || '30'), 10));
+  if (auditRetentionDays > 0) {
+    const cronAudit = require('node-cron');
+    cronAudit.schedule('0 3 * * *', async () => {
+      try {
+        const { runAuditRetentionJob } = await import('./jobs/auditRetentionJob');
+        await runAuditRetentionJob();
+      } catch (e) {
+        console.warn('⚠️ Audit retention job failed:', e);
+      }
+    });
+    console.log(`⏰ Audit retention cron scheduled for 03:00 daily (retention: ${auditRetentionDays} days)`);
+  } else {
+    console.log('⏰ Audit retention disabled (AUDIT_RETENTION_DAYS=0 or invalid)');
+  }
+
+  // Metrics aggregation: compute KPIs from calls + audit, store in metrics_monthly (Firestore, free tier)
+  const metricsEnabled = String(process.env.METRICS_AGGREGATION_ENABLED || 'true').toLowerCase() === 'true';
+  if (metricsEnabled) {
+    const cronMetrics = require('node-cron');
+    cronMetrics.schedule('0 2 1 * *', async () => {
+      try {
+        const { runMetricsAggregationJob } = await import('./jobs/metricsAggregationJob');
+        await runMetricsAggregationJob();
+      } catch (e) {
+        console.warn('⚠️ Metrics aggregation job failed:', e);
+      }
+    });
+    console.log('⏰ Metrics aggregation cron scheduled for 1st of month at 02:00');
   }
 
   // Lightweight TTL cleanup for stale matchQueue entries + run matchmaker

@@ -1,4 +1,6 @@
 import { db } from '../firebase';
+import { logAuditEvent } from '../utils/audit';
+
 const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@howdy.app';
 const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -161,6 +163,21 @@ export async function recordDeclineInfraction(
       moderation: result,
     });
   });
+
+  if (result.notice || result.recommendedLockUntil) {
+    logAuditEvent({
+      actorUid: uid,
+      actorType: 'system',
+      action: 'decline_infraction',
+      entityType: 'behavior_infraction',
+      entityId: uid,
+      metadata: {
+        reason: result.reason,
+        lockUntil: result.recommendedLockUntil ?? null,
+      },
+      category: 'moderation',
+    }).catch(() => {});
+  }
   return result;
 }
 
@@ -245,6 +262,23 @@ export async function recordShortCallInfraction(
       moderation: result,
     });
   });
+
+  if (result.notice || result.recommendedLockUntil) {
+    logAuditEvent({
+      actorUid: uid,
+      actorType: 'system',
+      action: 'short_call_infraction',
+      entityType: 'behavior_infraction',
+      entityId: uid,
+      metadata: {
+        reason: result.reason,
+        channelName: details.channelName,
+        durationSec: details.durationSec,
+        lockUntil: result.recommendedLockUntil ?? null,
+      },
+      category: 'moderation',
+    }).catch(() => {});
+  }
   return result;
 }
 
@@ -331,5 +365,21 @@ export async function recordMatchTimeoutInfraction(
     });
   });
 
+  if (result.notice || result.recommendedLockUntil) {
+    logAuditEvent({
+      actorUid: uid,
+      actorType: 'system',
+      action: 'match_timeout_infraction',
+      entityType: 'behavior_infraction',
+      entityId: uid,
+      metadata: {
+        reason: result.reason,
+        partnerId: details.partnerId ?? null,
+        channelName: details.channelName ?? null,
+        lockUntil: result.recommendedLockUntil ?? null,
+      },
+      category: 'moderation',
+    }).catch(() => {});
+  }
   return result;
 }

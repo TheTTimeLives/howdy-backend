@@ -1,4 +1,5 @@
 // src/routes/calls.ts
+import { randomUUID } from 'crypto';
 import express, { type RequestHandler } from 'express';
 import { verifyJwt } from '../verifyJwt';
 import { db } from '../firebase';
@@ -7,6 +8,7 @@ import fetch from 'node-fetch';
 import { Storage, type File } from '@google-cloud/storage';
 import { FieldValue } from 'firebase-admin/firestore';
 import { recordShortCallInfraction } from '../services/behaviorInfractions';
+import { logAuditEvent } from '../utils/audit';
 
 export const callsRouter = express.Router();
 callsRouter.use(verifyJwt);
@@ -56,6 +58,14 @@ const GCS_REGION_CODE = Number(process.env.GCS_REGION_CODE ?? 0);
 // AssemblyAI
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || '';
 const ASSEMBLYAI_WEBHOOK_SECRET = process.env.ASSEMBLYAI_WEBHOOK_SECRET || 'secret';
+
+/** assemblyai (default) | cloudflare — Cloudflare Worker runs Whisper + Llama Guard, then POSTs to /webhooks/cloudflare-transcription */
+const TRANSCRIPTION_PROVIDER = (process.env.TRANSCRIPTION_PROVIDER || 'assemblyai').toLowerCase();
+const CLOUDFLARE_TRANSCRIBE_WORKER_URL = (process.env.CLOUDFLARE_TRANSCRIBE_WORKER_URL || '').trim();
+const CLOUDFLARE_TRANSCRIBE_INGRESS_SECRET = (process.env.CLOUDFLARE_TRANSCRIBE_INGRESS_SECRET || '').trim();
+/** Shared secret Worker sends as X-CF-Transcribe-Signature; defaults to ASSEMBLYAI_WEBHOOK_SECRET if unset */
+const CLOUDFLARE_TRANSCRIPTION_WEBHOOK_SECRET =
+  (process.env.CLOUDFLARE_TRANSCRIPTION_WEBHOOK_SECRET || '').trim() || ASSEMBLYAI_WEBHOOK_SECRET;
 
 // Optional: archive transcripts
 const ARCHIVE_TRANSCRIPTS_TO_GCS =
@@ -238,6 +248,16 @@ callsRouter.post('/start', async (req, res) => {
     }
 
     await ensureCallDoc(channelName, [caller, ...participants]);
+
+    logAuditEvent({
+      actorUid: caller,
+      actorType: 'user',
+      action: 'call_started',
+      entityType: 'call',
+      entityId: channelName,
+      metadata: { participants: [caller, ...participants].filter(Boolean) },
+      category: 'calls',
+    }).catch(() => {});
 
     // Best-effort: trigger icebreaker generation once at call setup so both clients see the same prompt.
     // Trigger early (fire-and-forget) before any early returns from recording flow.
@@ -744,6 +764,15 @@ callsRouter.get('/:channelName/status', async (req, res) => {
 
     const freshSnap = await ref.get();
     const freshData = freshSnap.data() || {};
+    const participantsResolved = Array.from(
+      new Set(
+        ((Array.isArray(freshData.participants) ? freshData.participants : []) as any[])
+          .map((x: any) => String(x || '').trim())
+          .filter((x: string) => x.length > 0)
+      )
+    );
+    const partnerUidResolved =
+      participantsResolved.find((p) => p && p !== requesterUid) || null;
     return res.json({
       active: !!freshData.active,
       startedAt: freshData.startedAt || null,
@@ -756,6 +785,9 @@ callsRouter.get('/:channelName/status', async (req, res) => {
         partnerReconnectionSecondsLeft != null && partnerReconnectionSecondsLeft > 0,
       partnerReconnectionDeadline,
       partnerReconnectionSecondsLeft,
+      /** Other call participant (auth uid), for post-call review / connection request */
+      partnerUid: partnerUidResolved,
+      participants: participantsResolved,
     });
   } catch (e) {
     console.error('❌ /calls/:channelName/status error', e);
@@ -792,6 +824,19 @@ callsRouter.post('/:channelName/end', async (req, res) => {
         { merge: true }
       );
     });
+
+    logAuditEvent({
+      actorUid: ender,
+      actorType: 'user',
+      action: 'call_ended',
+      entityType: 'call',
+      entityId: channelName,
+      metadata: {
+        reason: reason || 'ended',
+        durationSec: startedAt ? Math.floor((endedAt - startedAt) / 1000) : null,
+      },
+      category: 'calls',
+    }).catch(() => {});
 
     // Phase 1: telemetry only (no enforcement side effects).
     let moderation = null;
@@ -1639,13 +1684,9 @@ callsRouter.get('/:channelName/recording-url', async (req, res) => {
   }
 });
 
-// ========= AssemblyAI submission (idempotent) =========
+// ========= Transcription: AssemblyAI or Cloudflare Worker (Whisper + Llama Guard) =========
 callsRouter.post('/:channelName/transcribe', async (req, res) => {
   try {
-    if (!ASSEMBLYAI_API_KEY) {
-      return res.status(500).json({ error: 'Missing ASSEMBLYAI_API_KEY' });
-    }
-
     const { channelName } = req.params;
     console.log('🔊 channelName:', channelName);
     const ref = channelDocRef(channelName);
@@ -1695,9 +1736,80 @@ callsRouter.post('/:channelName/transcribe', async (req, res) => {
 
     const signedUrl = await signedReadUrl(file);
 
-    // use the public webhook base (from ngrok locally) to receive webhooks
-    console.log('🔊 PUBLIC_BASE_URL:', process.env.PUBLIC_BASE_URL);
     const webhookUrlBase = process.env.PUBLIC_BASE_URL || process.env.API_BASE_URL || '';
+
+    if (TRANSCRIPTION_PROVIDER === 'cloudflare') {
+      if (!CLOUDFLARE_TRANSCRIBE_WORKER_URL || !CLOUDFLARE_TRANSCRIBE_INGRESS_SECRET) {
+        await releaseSubmitLock(channelName, submitLockId!);
+        return res.status(500).json({
+          error:
+            'Cloudflare transcribe: set CLOUDFLARE_TRANSCRIBE_WORKER_URL and CLOUDFLARE_TRANSCRIBE_INGRESS_SECRET',
+        });
+      }
+      if (!CLOUDFLARE_TRANSCRIPTION_WEBHOOK_SECRET) {
+        await releaseSubmitLock(channelName, submitLockId!);
+        return res.status(500).json({
+          error: 'Set CLOUDFLARE_TRANSCRIPTION_WEBHOOK_SECRET (or ASSEMBLYAI_WEBHOOK_SECRET)',
+        });
+      }
+      if (!webhookUrlBase) {
+        await releaseSubmitLock(channelName, submitLockId!);
+        return res.status(500).json({
+          error: 'PUBLIC_BASE_URL or API_BASE_URL required so the Worker can call the transcription webhook',
+        });
+      }
+
+      const transcriptId = `cf_${randomUUID()}`;
+      const cfWebhookUrl = `${webhookUrlBase.replace(/\/$/, '')}/webhooks/cloudflare-transcription`;
+
+      const cfResp = await fetch(CLOUDFLARE_TRANSCRIBE_WORKER_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${CLOUDFLARE_TRANSCRIBE_INGRESS_SECRET}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          signedUrl,
+          channelName,
+          webhookUrl: cfWebhookUrl,
+          webhookSecret: CLOUDFLARE_TRANSCRIPTION_WEBHOOK_SECRET,
+          transcriptId,
+        }),
+      });
+
+      if (!cfResp.ok) {
+        const t = await cfResp.text();
+        await releaseSubmitLock(channelName, submitLockId!);
+        console.error('Cloudflare Worker ingress failed', cfResp.status, t.slice(0, 500));
+        return res.status(502).json({ error: `Cloudflare Worker ingress failed ${cfResp.status}: ${t}` });
+      }
+
+      console.log(
+        '[CF transcribe] Worker accepted job',
+        JSON.stringify({ channelName, transcriptId, webhook: cfWebhookUrl })
+      );
+
+      await ref.set(
+        {
+          transcription: {
+            id: transcriptId,
+            status: 'processing',
+            provider: 'cloudflare',
+            submittedAt: Date.now(),
+          },
+        },
+        { merge: true }
+      );
+      await releaseSubmitLock(channelName, submitLockId!);
+      return res.json({ ok: true, id: transcriptId, provider: 'cloudflare' });
+    }
+
+    if (!ASSEMBLYAI_API_KEY) {
+      await releaseSubmitLock(channelName, submitLockId!);
+      return res.status(500).json({ error: 'Missing ASSEMBLYAI_API_KEY' });
+    }
+
+    console.log('PUBLIC_BASE_URL (assemblyai transcribe):', process.env.PUBLIC_BASE_URL);
     const webhookUrl = `${webhookUrlBase}/webhooks/assemblyai?channel=${encodeURIComponent(channelName)}`;
 
     const aaiResp = await fetch('https://api.assemblyai.com/v2/transcript', {
@@ -1891,6 +2003,159 @@ export const assemblyAiWebhookHandler: RequestHandler = async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     console.error('❌ AssemblyAI webhook error', e);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+};
+
+/** Webhook from Cloudflare transcribe Worker (Whisper + Llama Guard). */
+export const cloudflareTranscriptionWebhookHandler: RequestHandler = async (req, res) => {
+  try {
+    const sig = String(req.header('X-CF-Transcribe-Signature') || '');
+    if (!CLOUDFLARE_TRANSCRIPTION_WEBHOOK_SECRET || sig !== CLOUDFLARE_TRANSCRIPTION_WEBHOOK_SECRET) {
+      console.warn('Cloudflare transcribe webhook: rejected (bad X-CF-Transcribe-Signature)');
+      return res.status(401).json({ error: 'Invalid webhook signature' });
+    }
+
+    const payload: any = req.body || {};
+    const channel = String(payload.channelName || '');
+    if (!channel) return res.status(400).json({ error: 'Missing channelName' });
+
+    const transcriptId = payload.transcriptId != null ? String(payload.transcriptId) : '';
+    const hookStatus = String(payload.status || '');
+    console.log(
+      '[CF transcribe webhook]',
+      JSON.stringify({ channel, transcriptId, status: hookStatus })
+    );
+
+    const callSnap = await channelDocRef(channel).get();
+    const callData = callSnap.data() || {};
+    const currentTr = callData.transcription || {};
+    const currentId: string | null = currentTr.id || null;
+
+    if (transcriptId && currentId && transcriptId !== currentId) {
+      await channelDocRef(channel).set(
+        { transcription: { duplicates: FieldValue.arrayUnion(transcriptId), updatedAt: Date.now() } },
+        { merge: true }
+      );
+      return res.json({ ok: true, ignored: true });
+    }
+
+    if (payload.status === 'completed') {
+      const text = payload.text ?? null;
+      const moderation = payload.moderation ?? null;
+      const rec = callData.rec || {};
+      const bucketForArchive = String(rec.bucket || GCS_BUCKET || '');
+
+      await channelDocRef(channel).set(
+        {
+          transcription: {
+            id: transcriptId || currentId,
+            status: 'completed',
+            provider: 'cloudflare',
+            text,
+            moderation,
+            completedAt: Date.now(),
+            updatedAt: Date.now(),
+          },
+        },
+        { merge: true }
+      );
+
+      if (ARCHIVE_TRANSCRIPTS_TO_GCS && bucketForArchive && transcriptId) {
+        try {
+          const baseId = transcriptId.replace(/[^a-zA-Z0-9_-]/g, '_');
+          const recBase: string | undefined =
+            typeof rec.objectPathBase === 'string' ? rec.objectPathBase : undefined;
+          const base = recBase
+            ? `${recBase.replace(/\/$/, '')}/transcripts/${baseId}`
+            : `${TRANSCRIPTS_PREFIX}/${encodeURIComponent(channel)}/${baseId}`;
+
+          const jsonPayload = JSON.stringify(
+            {
+              text,
+              moderation,
+              vtt: payload.vtt ?? null,
+              transcription_info: payload.transcription_info ?? null,
+              transcriptId,
+            },
+            null,
+            2
+          );
+          await saveStringToGcs(bucketForArchive, `${base}/transcript.json`, jsonPayload, 'application/json');
+          if (text) {
+            await saveStringToGcs(
+              bucketForArchive,
+              `${base}/transcript.txt`,
+              String(text),
+              'text/plain; charset=utf-8'
+            );
+          }
+          if (payload.vtt) {
+            await saveStringToGcs(
+              bucketForArchive,
+              `${base}/transcript.vtt`,
+              String(payload.vtt),
+              'text/vtt; charset=utf-8'
+            );
+          }
+
+          await channelDocRef(channel).set(
+            {
+              transcription: {
+                archivedToGcs: true,
+                gcs: {
+                  bucket: bucketForArchive,
+                  basePrefix: base,
+                  json: `gs://${bucketForArchive}/${base}/transcript.json`,
+                  txt: `gs://${bucketForArchive}/${base}/transcript.txt`,
+                  ...(payload.vtt
+                    ? { vtt: `gs://${bucketForArchive}/${base}/transcript.vtt` }
+                    : {}),
+                },
+              },
+            },
+            { merge: true }
+          );
+        } catch (archiveErr) {
+          console.warn('Cloudflare transcript archive to GCS failed:', archiveErr);
+        }
+      }
+
+      console.log(
+        '[CF transcribe] Firestore updated (completed)',
+        JSON.stringify({
+          channel,
+          transcriptId: transcriptId || currentId,
+          textChars: typeof text === 'string' ? text.length : 0,
+        })
+      );
+      return res.json({ ok: true });
+    }
+
+    if (payload.status === 'error') {
+      console.warn(
+        '[CF transcribe] Worker reported error',
+        JSON.stringify({ channel, transcriptId, error: payload.error ?? 'unknown' })
+      );
+      await channelDocRef(channel).set(
+        {
+          transcription: {
+            id: transcriptId || currentId,
+            status: 'error',
+            provider: 'cloudflare',
+            error: payload.error ?? 'unknown',
+            completedAt: Date.now(),
+            updatedAt: Date.now(),
+          },
+        },
+        { merge: true }
+      );
+      return res.json({ ok: true });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('Cloudflare transcription webhook error', e);
     return res.status(500).json({ error: 'Internal Error' });
   }
 };

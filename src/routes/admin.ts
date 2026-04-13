@@ -98,6 +98,7 @@ adminRouter.post('/system-admins/:targetUid', async (req, res) => {
       entityType: 'user_metadata',
       entityId: targetUid,
       metadata: { reason },
+      category: 'admin',
     });
 
     return res.status(200).json({ ok: true, targetUid, isSystemAdmin: enabled });
@@ -200,6 +201,7 @@ adminRouter.post('/id-collisions/:caseId/decision', async (req, res) => {
       entityType: 'identity_collision_case',
       entityId: caseId,
       metadata: { reason: auditReason, decisionReason: reason, userId: targetUid, reviewedBy: uid },
+      category: 'identity_verification',
     });
 
     return res.status(200).json({ ok: true });
@@ -214,6 +216,7 @@ adminRouter.get('/activity-audit', async (req, res) => {
   const actorType = String(req.query.actorType || '').trim();
   const actorUid = String(req.query.actorUid || '').trim();
   const action = String(req.query.action || '').trim();
+  const category = String(req.query.category || '').trim();
   const limit = Math.min(Number(req.query.limit || 100), 500);
   try {
     const allowed = await isSystemAdmin(uid);
@@ -232,6 +235,9 @@ adminRouter.get('/activity-audit', async (req, res) => {
     if (action) {
       query = query.where('action', '==', action);
     }
+    if (category) {
+      query = query.where('category', '==', category);
+    }
 
     const snap = await query.get();
     const items = snap.docs
@@ -241,6 +247,45 @@ adminRouter.get('/activity-audit', async (req, res) => {
   } catch (e) {
     console.error('❌ Failed to fetch activity audit:', e);
     return res.status(500).json({ error: 'Failed to fetch activity audit' });
+  }
+});
+
+adminRouter.get('/metrics', async (req, res) => {
+  const uid = String((req as any).uid || '');
+  const limit = Math.min(Number(req.query.limit || 12), 24); // months
+  try {
+    const allowed = await isSystemAdmin(uid);
+    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+
+    const snap = await db
+      .collection('metrics_monthly')
+      .orderBy('period', 'desc')
+      .limit(limit)
+      .get();
+
+    const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    return res.status(200).json({ items });
+  } catch (e) {
+    console.error('❌ Failed to fetch metrics:', e);
+    return res.status(500).json({ error: 'Failed to fetch metrics' });
+  }
+});
+
+adminRouter.post('/metrics/aggregate', async (req, res) => {
+  const uid = String((req as any).uid || '');
+  const { year, month } = req.body || {};
+  try {
+    const allowed = await isSystemAdmin(uid);
+    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+
+    const forMonth =
+      typeof year === 'number' && typeof month === 'number' ? { year, month } : undefined;
+    const { runMetricsAggregationJob } = await import('../jobs/metricsAggregationJob');
+    const metrics = await runMetricsAggregationJob(forMonth);
+    return res.status(200).json({ ok: true, metrics });
+  } catch (e) {
+    console.error('❌ Failed to run metrics aggregation:', e);
+    return res.status(500).json({ error: 'Failed to run metrics aggregation' });
   }
 });
 

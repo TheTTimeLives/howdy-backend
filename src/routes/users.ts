@@ -16,6 +16,42 @@ const SUPPORT_EMAIL = process.env.SUPPORT_EMAIL || 'support@howdy.app';
 export const usersRouter = express.Router();
 usersRouter.use(verifyJwt);
 
+/** Server-side read of connection requests + confirmed (bypasses client Firestore rules). */
+async function fetchConnectionsBundle(targetUid: string): Promise<{
+  requests: Array<{
+    fromUid: string;
+    username: string;
+    photoUrl: string;
+    timestamp: number | null;
+  }>;
+  confirmed: Array<{ uid: string; username: string; photoUrl: string }>;
+}> {
+  const [reqSnap, confSnap] = await Promise.all([
+    db.collection('connections').doc(targetUid).collection('requests').get(),
+    db.collection('connections').doc(targetUid).collection('confirmed').get(),
+  ]);
+  const requests = reqSnap.docs.map((d) => {
+    const x = d.data() || {};
+    return {
+      fromUid: d.id,
+      username: String(x.username ?? d.id),
+      photoUrl: String(x.photoUrl ?? ''),
+      timestamp: typeof x.timestamp === 'number' ? x.timestamp : null,
+    };
+  });
+  const confirmed = confSnap.docs
+    .map((d) => {
+      const x = d.data() || {};
+      return {
+        uid: d.id,
+        username: String(x.username ?? d.id),
+        photoUrl: String(x.photoUrl ?? ''),
+      };
+    })
+    .filter((c) => c.uid !== targetUid);
+  return { requests, confirmed };
+}
+
 usersRouter.get('/me', async (req, res) => {
   const uid = (req as any).uid;
 
@@ -128,6 +164,18 @@ usersRouter.get('/me', async (req, res) => {
   }
 });
 
+// GET /users/me/connections — incoming requests + confirmed (must be before /:uid routes)
+usersRouter.get('/me/connections', async (req, res) => {
+  const myUid = String((req as any).uid || '').trim();
+  if (!myUid) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const bundle = await fetchConnectionsBundle(myUid);
+    return res.status(200).json(bundle);
+  } catch (e) {
+    console.error('GET /users/me/connections failed', e);
+    return res.status(500).json({ error: 'Failed to load connections' });
+  }
+});
 
 usersRouter.post('/verification/reset', async (req, res) => {
   const uid = (req as any).uid;
@@ -363,6 +411,28 @@ usersRouter.get('/by-virtual-number', async (req, res) => {
   } catch (e) {
     console.error('❌ by-virtual-number lookup failed:', e);
     return res.status(500).json({ error: 'Lookup failed' });
+   }
+});
+
+// GET /users/:targetUid/connections — same as /me/connections for another uid (self or system admin)
+usersRouter.get('/:targetUid/connections', async (req, res) => {
+  const requester = String((req as any).uid || '').trim();
+  const targetUid = String(req.params.targetUid || '').trim();
+  if (!targetUid) return res.status(400).json({ error: 'Missing user ID' });
+  if (!requester) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    if (requester !== targetUid) {
+      const meta = await db.collection('user_metadata').doc(requester).get();
+      if (meta.data()?.isSystemAdmin !== true) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    }
+    const bundle = await fetchConnectionsBundle(targetUid);
+    return res.status(200).json(bundle);
+  } catch (e) {
+    console.error('GET /users/:targetUid/connections failed', e);
+    return res.status(500).json({ error: 'Failed to load connections' });
   }
 });
 
@@ -674,6 +744,196 @@ usersRouter.put('/members/:memberId/settings', async (req, res) => {
 
 // ===== Review & Connection Endpoints =====
 
+// GET /users/:uid/contact-info - For contact call tree: isConnection, pending counts, username
+usersRouter.get('/:uid/contact-info', async (req, res) => {
+  const myUid = (req as any).uid;
+  const otherUid = String(req.params.uid || '').trim();
+  if (!otherUid) return res.status(400).json({ error: 'Missing user ID' });
+
+  try {
+    const [confirmedMine, confirmedTheirs, requestFromThem, otherMeta] = await Promise.all([
+      db.collection('connections').doc(myUid).collection('confirmed').doc(otherUid).get(),
+      db.collection('connections').doc(otherUid).collection('confirmed').doc(myUid).get(),
+      db.collection('connections').doc(myUid).collection('requests').doc(otherUid).get(),
+      db.collection('user_metadata').doc(otherUid).get(),
+    ]);
+
+    const isConnection = confirmedMine.exists || confirmedTheirs.exists;
+    const hasConnectionRequestFromThem = requestFromThem.exists;
+    const username = String(otherMeta.data()?.username || otherUid).trim() || 'this user';
+
+    // Stub: messages and schedule requests (not yet implemented)
+    const unreadMessageCount = 0;
+    const scheduleRequestCount = 0;
+
+    return res.status(200).json({
+      username,
+      isConnection,
+      hasConnectionRequestFromThem,
+      unreadMessageCount,
+      scheduleRequestCount,
+    });
+  } catch (e) {
+    console.error('❌ GET contact-info failed:', e);
+    return res.status(500).json({ error: 'Failed to fetch contact info' });
+  }
+});
+
+// GET /users/:uid/messages - Last N messages with this user (for contact call tree)
+usersRouter.get('/:uid/messages', async (req, res) => {
+  const myUid = (req as any).uid;
+  const otherUid = String(req.params.uid || '').trim();
+  const limit = Math.min(Number(req.query.limit) || 10, 20);
+  if (!otherUid) return res.status(400).json({ error: 'Missing user ID' });
+
+  try {
+    const [confirmedMine, confirmedTheirs] = await Promise.all([
+      db.collection('connections').doc(myUid).collection('confirmed').doc(otherUid).get(),
+      db.collection('connections').doc(otherUid).collection('confirmed').doc(myUid).get(),
+    ]);
+    if (!confirmedMine.exists && !confirmedTheirs.exists) {
+      return res.status(403).json({ error: 'Not a connection' });
+    }
+
+    const sorted = [myUid, otherUid].sort();
+    const chatId = `${sorted[0]}_${sorted[1]}`;
+    const snap = await db
+      .collection('chats')
+      .doc(chatId)
+      .collection('messages')
+      .orderBy('timestamp', 'desc')
+      .limit(limit)
+      .get();
+
+    const messages = snap.docs.map((d) => {
+      const data = d.data() || {};
+      return {
+        id: d.id,
+        senderId: data.senderId || null,
+        text: data.text || null,
+        voiceUrl: data.voiceUrl || null,
+        timestamp: data.timestamp || null,
+      };
+    });
+    return res.status(200).json({ messages });
+  } catch (e) {
+    console.error('❌ GET messages failed:', e);
+    return res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// POST /users/:uid/messages - Send a text message to this user (for contact call tree voice-to-text)
+usersRouter.post('/:uid/messages', async (req, res) => {
+  const myUid = (req as any).uid;
+  const otherUid = String(req.params.uid || '').trim();
+  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+  if (!otherUid) return res.status(400).json({ error: 'Missing user ID' });
+  if (text.length === 0) return res.status(400).json({ error: 'Message text is required' });
+  if (text.length > 2000) return res.status(400).json({ error: 'Message too long' });
+
+  try {
+    const [confirmedMine, confirmedTheirs] = await Promise.all([
+      db.collection('connections').doc(myUid).collection('confirmed').doc(otherUid).get(),
+      db.collection('connections').doc(otherUid).collection('confirmed').doc(myUid).get(),
+    ]);
+    if (!confirmedMine.exists && !confirmedTheirs.exists) {
+      return res.status(403).json({ error: 'Not a connection' });
+    }
+
+    const sorted = [myUid, otherUid].sort();
+    const chatId = `${sorted[0]}_${sorted[1]}`;
+    const chatRef = db.collection('chats').doc(chatId);
+    const chatSnap = await chatRef.get();
+    if (!chatSnap.exists) {
+      await chatRef.set({ createdAt: Date.now(), participants: sorted });
+    }
+
+    await chatRef.collection('messages').add({
+      senderId: myUid,
+      text,
+      timestamp: Date.now(),
+    });
+
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('❌ POST messages failed:', e);
+    return res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+// GET /users/:uid/connection-requests - List connection requests from this user to me (for contact call tree)
+usersRouter.get('/:uid/connection-requests', async (req, res) => {
+  const myUid = (req as any).uid;
+  const otherUid = String(req.params.uid || '').trim();
+  if (!otherUid) return res.status(400).json({ error: 'Missing user ID' });
+
+  try {
+    const doc = await db.collection('connections').doc(myUid).collection('requests').doc(otherUid).get();
+    if (!doc.exists) return res.status(200).json({ requests: [] });
+
+    const data = doc.data() || {};
+    return res.status(200).json({
+      requests: [{
+        id: otherUid,
+        fromUid: otherUid,
+        username: data.username || otherUid,
+        timestamp: data.timestamp || Date.now(),
+      }],
+    });
+  } catch (e) {
+    console.error('❌ GET connection-requests failed:', e);
+    return res.status(500).json({ error: 'Failed to fetch connection requests' });
+  }
+});
+
+// POST /users/:uid/connection-requests/respond - Approve or decline connection request from this user
+usersRouter.post('/:uid/connection-requests/respond', async (req, res) => {
+  const myUid = (req as any).uid;
+  const otherUid = String(req.params.uid || '').trim();
+  const { action } = req.body || {}; // 'approve' | 'decline'
+  if (!otherUid) return res.status(400).json({ error: 'Missing user ID' });
+  if (action !== 'approve' && action !== 'decline') return res.status(400).json({ error: 'Invalid action' });
+
+  try {
+    const reqDoc = await db.collection('connections').doc(myUid).collection('requests').doc(otherUid).get();
+    if (!reqDoc.exists) return res.status(404).json({ error: 'No pending request from this user' });
+
+    if (action === 'approve') {
+      const [myMeta, otherMeta] = await Promise.all([
+        db.collection('user_metadata').doc(myUid).get(),
+        db.collection('user_metadata').doc(otherUid).get(),
+      ]);
+      const myName = myMeta.data()?.username || 'User';
+      const otherName = otherMeta.data()?.username || 'User';
+
+      const batch = db.batch();
+      batch.set(
+        db.collection('connections').doc(myUid).collection('confirmed').doc(otherUid),
+        { username: otherName, timestamp: Date.now() },
+        { merge: true }
+      );
+      batch.set(
+        db.collection('connections').doc(otherUid).collection('confirmed').doc(myUid),
+        { username: myName, timestamp: Date.now() },
+        { merge: true }
+      );
+      batch.delete(db.collection('connections').doc(myUid).collection('requests').doc(otherUid));
+      batch.delete(db.collection('connections').doc(otherUid).collection('requests').doc(myUid));
+      await batch.commit();
+    } else {
+      const batch = db.batch();
+      batch.delete(db.collection('connections').doc(myUid).collection('requests').doc(otherUid));
+      batch.delete(db.collection('connections').doc(otherUid).collection('requests').doc(myUid));
+      await batch.commit();
+    }
+
+    return res.status(200).json({ ok: true, action });
+  } catch (e) {
+    console.error('❌ POST connection-requests/respond failed:', e);
+    return res.status(500).json({ error: 'Failed to respond' });
+  }
+});
+
 // GET /users/:uid/connection-status - Check connection status with another user
 usersRouter.get('/:uid/connection-status', async (req, res) => {
   const currentUid = (req as any).uid;
@@ -773,9 +1033,15 @@ usersRouter.post('/:uid/connection-request', async (req, res) => {
   }
 
   try {
-    // Get current user's username
+    const targetMeta = await db.collection('user_metadata').doc(targetUid).get();
+    if (!targetMeta.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
     const currentUserDoc = await db.collection('user_metadata').doc(currentUid).get();
-    const username = currentUserDoc.data()?.username || 'Unknown';
+    const meta = currentUserDoc.data() || {};
+    const username = String(meta.username || 'Someone you met').trim() || 'Someone you met';
+    const photoUrl = String(meta.photoUrl || '').trim();
 
     // Check if already connected
     const confirmedDoc = await db
@@ -801,16 +1067,19 @@ usersRouter.post('/:uid/connection-request', async (req, res) => {
       return res.status(400).json({ error: 'Request already sent' });
     }
 
-    // Send connection request
     await db
       .collection('connections')
       .doc(targetUid)
       .collection('requests')
       .doc(currentUid)
-      .set({
-        username,
-        timestamp: Date.now(),
-      });
+      .set(
+        {
+          username,
+          timestamp: Date.now(),
+          ...(photoUrl ? { photoUrl } : {}),
+        },
+        { merge: true }
+      );
 
     console.log(`✅ Connection request sent: ${currentUid} (${username}) -> ${targetUid}`);
     return res.status(200).json({ ok: true });
