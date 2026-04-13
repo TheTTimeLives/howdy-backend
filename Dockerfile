@@ -1,8 +1,9 @@
 FROM node:18-alpine AS base
 WORKDIR /app
-ENV NODE_ENV=production
 
+# Do not set NODE_ENV=production on `base`: build stage needs devDependencies (typescript).
 FROM base AS deps
+ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm ci --omit=dev
 
