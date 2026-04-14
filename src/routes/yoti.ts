@@ -38,9 +38,26 @@ const {
 const isSandbox = process.env.YOTI_ENV === 'sandbox';
 
 // 🔑 Dynamic Configs
+function loadYotiPrivateKeyPem(): string {
+  const b64 = process.env.YOTI_KEY_PEM_B64?.trim();
+  if (b64) {
+    return Buffer.from(b64, 'base64').toString('utf8');
+  }
+  const inline = process.env.YOTI_KEY_PEM?.trim();
+  if (inline) {
+    return inline.includes('\\n') ? inline.replace(/\\n/g, '\n') : inline;
+  }
+  const file = process.env.YOTI_KEY_FILE?.trim();
+  if (file) {
+    return fs.readFileSync(file, 'utf8');
+  }
+  throw new Error(
+    'Yoti: set YOTI_KEY_PEM_B64 (base64 PEM, best for Cloud Run), YOTI_KEY_PEM, or YOTI_KEY_FILE'
+  );
+}
+
 const YOTI_CLIENT_SDK_ID = process.env.YOTI_CLIENT_SDK_ID!;
-const YOTI_KEY_FILE = process.env.YOTI_KEY_FILE!;
-const YOTI_KEY = fs.readFileSync(YOTI_KEY_FILE, 'utf8');
+const YOTI_KEY = loadYotiPrivateKeyPem();
 const YOTI_SUCCESS_URL = process.env.YOTI_SUCCESS_URL!;
 const YOTI_ERROR_URL = process.env.YOTI_ERROR_URL!;
 const YOTI_WEBHOOK_AUTH = process.env.YOTI_WEBHOOK_AUTH || 'howdy:yoti';

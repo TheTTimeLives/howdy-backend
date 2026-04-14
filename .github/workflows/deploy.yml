@@ -89,6 +89,9 @@ jobs:
           IMAGE: ${{ steps.meta.outputs.image }}
           # Runtime env (optional, set in repo/env secrets)
           NODE_ENV: production
+          PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
+          API_BASE_URL: ${{ vars.API_BASE_URL }}
+          INVITE_LANDING_BASE_URL: ${{ vars.INVITE_LANDING_BASE_URL }}
           ENABLE_TRANSCRIPT_BACKFILL: ${{ secrets.ENABLE_TRANSCRIPT_BACKFILL }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
@@ -100,6 +103,8 @@ jobs:
           AGORA_REC_REGION: ${{ secrets.AGORA_REC_REGION }}
           GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
           GCS_PREFIX: ${{ secrets.GCS_PREFIX }}
+          GCS_INTEROP_ACCESS_KEY: ${{ secrets.GCS_INTEROP_ACCESS_KEY }}
+          GCS_INTEROP_SECRET_KEY: ${{ secrets.GCS_INTEROP_SECRET_KEY }}
           TRANSCRIPTS_PREFIX: ${{ secrets.TRANSCRIPTS_PREFIX }}
           ARCHIVE_TRANSCRIPTS_TO_GCS: ${{ secrets.ARCHIVE_TRANSCRIPTS_TO_GCS }}
           ASSEMBLYAI_API_KEY: ${{ secrets.ASSEMBLYAI_API_KEY }}
@@ -111,6 +116,13 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           FIREBASE_BUCKET: ${{ secrets.FIREBASE_BUCKET }}
+          PII_ENCRYPTION_KEY: ${{ secrets.PII_ENCRYPTION_KEY }}
+          YOTI_ENV: ${{ secrets.YOTI_ENV }}
+          YOTI_CLIENT_SDK_ID: ${{ secrets.YOTI_CLIENT_SDK_ID }}
+          YOTI_KEY_PEM_B64: ${{ secrets.YOTI_KEY_PEM_B64 }}
+          YOTI_SUCCESS_URL: ${{ secrets.YOTI_SUCCESS_URL }}
+          YOTI_ERROR_URL: ${{ secrets.YOTI_ERROR_URL }}
+          YOTI_WEBHOOK_AUTH: ${{ secrets.YOTI_WEBHOOK_AUTH }}
         run: |
           set -euo pipefail
           svc="${SERVICE:-howdy-backend}"
@@ -120,11 +132,14 @@ jobs:
           # Build env list dynamically (include only non-empty)
           ENV_LIST="NODE_ENV=production"
           add_var() { v="$1"; val="${!v:-}"; if [ -n "$val" ]; then val="${val//,/\\,}"; ENV_LIST="$ENV_LIST,$v=$val"; fi }
-          for v in ENABLE_TRANSCRIPT_BACKFILL JWT_SECRET STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET \
+          for v in PUBLIC_BASE_URL API_BASE_URL INVITE_LANDING_BASE_URL \
+ ENABLE_TRANSCRIPT_BACKFILL JWT_SECRET STRIPE_SECRET_KEY STRIPE_WEBHOOK_SECRET \
                    AGORA_APP_ID AGORA_APP_CERTIFICATE AGORA_REC_CUSTOMER_ID AGORA_REC_CUSTOMER_CERT AGORA_REC_REGION \
-                   GCS_BUCKET GCS_PREFIX TRANSCRIPTS_PREFIX ARCHIVE_TRANSCRIPTS_TO_GCS \
+                   GCS_BUCKET GCS_PREFIX GCS_INTEROP_ACCESS_KEY GCS_INTEROP_SECRET_KEY \
+                   TRANSCRIPTS_PREFIX ARCHIVE_TRANSCRIPTS_TO_GCS \
                    ASSEMBLYAI_API_KEY ASSEMBLYAI_WEBHOOK_SECRET REVENUECAT_KEY \
-                   SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS OPENAI_API_KEY FIREBASE_BUCKET; do
+                   SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS OPENAI_API_KEY FIREBASE_BUCKET PII_ENCRYPTION_KEY \
+                   YOTI_ENV YOTI_CLIENT_SDK_ID YOTI_KEY_PEM_B64 YOTI_SUCCESS_URL YOTI_ERROR_URL YOTI_WEBHOOK_AUTH; do
             add_var "$v"
           done
           gcloud run deploy "$svc" \
