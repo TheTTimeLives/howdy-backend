@@ -56,15 +56,16 @@ function loadYotiPrivateKeyPem(): string {
   );
 }
 
-const YOTI_CLIENT_SDK_ID = process.env.YOTI_CLIENT_SDK_ID!;
-const YOTI_KEY = loadYotiPrivateKeyPem();
-const YOTI_SUCCESS_URL = process.env.YOTI_SUCCESS_URL!;
-const YOTI_ERROR_URL = process.env.YOTI_ERROR_URL!;
+const YOTI_CLIENT_SDK_ID = process.env.YOTI_CLIENT_SDK_ID || '';
+let YOTI_KEY = '';
+const YOTI_SUCCESS_URL = process.env.YOTI_SUCCESS_URL || 'howdy://verify-success';
+const YOTI_ERROR_URL = process.env.YOTI_ERROR_URL || 'howdy://verify-failure';
 const YOTI_WEBHOOK_AUTH = process.env.YOTI_WEBHOOK_AUTH || 'howdy:yoti';
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const YOTI_WEBHOOK_URL =
   process.env.YOTI_WEBHOOK_URL ||
   (PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL}/yoti/webhook` : undefined);
+let yotiInitError: string | null = null;
 
 const ENFORCE_ID_COLLISION_REVIEW =
   String(process.env.ENFORCE_ID_COLLISION_REVIEW ?? 'true').toLowerCase() === 'true';
@@ -83,11 +84,32 @@ if (isSandbox) {
 }
 
 // 🛠️ Initialize Yoti IDVClient (uses API URL from env var internally)
-const idvClient = new IDVClient(YOTI_CLIENT_SDK_ID, YOTI_KEY, {
-  apiUrl: isSandbox
-    ? 'https://api.yoti.com/sandbox/idverify/v1'
-    : 'https://api.yoti.com/idverify/v1',
-});
+let idvClient: IDVClient | null = null;
+try {
+  if (!YOTI_CLIENT_SDK_ID) {
+    throw new Error('YOTI_CLIENT_SDK_ID is not set');
+  }
+  YOTI_KEY = loadYotiPrivateKeyPem();
+  idvClient = new IDVClient(YOTI_CLIENT_SDK_ID, YOTI_KEY, {
+    apiUrl: isSandbox
+      ? 'https://api.yoti.com/sandbox/idverify/v1'
+      : 'https://api.yoti.com/idverify/v1',
+  });
+  console.log('✅ Yoti client initialized');
+} catch (err) {
+  yotiInitError = err instanceof Error ? err.message : String(err);
+  console.warn(`⚠️ Yoti disabled: ${yotiInitError}`);
+}
+
+function requireYotiClient(res: express.Response): IDVClient | null {
+  if (idvClient) return idvClient;
+  console.warn(`⚠️ Yoti endpoint called while unconfigured: ${yotiInitError ?? 'unknown error'}`);
+  res.status(503).json({
+    error: 'Yoti is not configured in this environment',
+    detail: yotiInitError ?? 'Missing Yoti environment configuration',
+  });
+  return null;
+}
 
 
 // 🔐 Secure Router
@@ -480,6 +502,8 @@ async function processSessionResult(
 // POST /yoti/session
 yotiRouter.post('/session', async (req, res) => {
   const uid = String((req as any).uid ?? '');
+  const client = requireYotiClient(res);
+  if (!client) return;
 
   console.log(`📦 Creating Yoti session for uid: ${uid}`);
 console.log(`🌍 Environment: ${isSandbox ? 'sandbox' : 'production'}`);
@@ -522,7 +546,7 @@ console.log(`🌍 Environment: ${isSandbox ? 'sandbox' : 'production'}`);
 
     const sessionSpec = specBuilder.build();
 
-    const sessionResult = await idvClient.createSession(sessionSpec);
+    const sessionResult = await client.createSession(sessionSpec);
     const sessionId = sessionResult.getSessionId();
     const clientSessionToken = sessionResult.getClientSessionToken();
 
@@ -605,6 +629,8 @@ console.log(`🌍 Environment: ${isSandbox ? 'sandbox' : 'production'}`);
 // GET /yoti/status
 yotiRouter.get('/status', async (req, res) => {
   const uid = (req as any).uid;
+  const client = requireYotiClient(res);
+  if (!client) return;
 
   try {
     const doc = await db.collection('user_metadata').doc(uid).get();
@@ -615,7 +641,7 @@ yotiRouter.get('/status', async (req, res) => {
     if ((status === 'verify-started' || status === 'processing') && data?.yotiSessionId) {
       try {
         const sessionId = data.yotiSessionId;
-        const sessionResult = await idvClient.getSession(sessionId);
+        const sessionResult = await client.getSession(sessionId);
         status = await processSessionResult(uid, sessionResult, 'status_poll');
         console.log(`[YOTI_STATUS] Poll result: uid=${uid} → ${status}`);
       } catch (pollErr) {
@@ -633,6 +659,8 @@ yotiRouter.get('/status', async (req, res) => {
 
 // POST /yoti/webhook
 yotiRouter.post('/webhook', async (req, res) => {
+  const client = requireYotiClient(res);
+  if (!client) return;
   const authHeader = req.headers['authorization'];
   const expectedAuth = 'Basic ' + Buffer.from(YOTI_WEBHOOK_AUTH).toString('base64');
 
@@ -650,7 +678,7 @@ yotiRouter.post('/webhook', async (req, res) => {
 
   try {
     if (topic === 'session_completion') {
-      const sessionResult = await idvClient.getSession(session_id);
+      const sessionResult = await client.getSession(session_id);
       const userId = sessionResult.getUserTrackingId();
 
       if (!userId) {
