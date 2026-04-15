@@ -18,19 +18,33 @@ import {
 
 // ✅ CommonJS require to bypass missing types
 const { token_sort_ratio } = require('fuzzball');
-const {
-  SandboxIDVClientBuilder,
-  SandboxRecommendationBuilder,
-  SandboxBreakdownBuilder,
-  SandboxDocumentAuthenticityCheckBuilder,
-  SandboxDocumentTextDataCheckBuilder,
-  SandboxZoomLivenessCheckBuilder,
-  SandboxDocumentFaceMatchCheckBuilder,
-  SandboxDocumentTextDataExtractionTaskBuilder,
-  SandboxCheckReportsBuilder,
-  SandboxTaskResultsBuilder,
-  SandboxResponseConfigBuilder,
-} = require('@getyoti/sdk-sandbox');
+
+type SandboxSdk = {
+  SandboxIDVClientBuilder: any;
+  SandboxRecommendationBuilder: any;
+  SandboxBreakdownBuilder: any;
+  SandboxDocumentAuthenticityCheckBuilder: any;
+  SandboxDocumentTextDataCheckBuilder: any;
+  SandboxZoomLivenessCheckBuilder: any;
+  SandboxDocumentFaceMatchCheckBuilder: any;
+  SandboxDocumentTextDataExtractionTaskBuilder: any;
+  SandboxCheckReportsBuilder: any;
+  SandboxTaskResultsBuilder: any;
+  SandboxResponseConfigBuilder: any;
+};
+
+let sandboxSdkCached: SandboxSdk | null | undefined;
+function getSandboxSdk(): SandboxSdk | null {
+  if (sandboxSdkCached !== undefined) return sandboxSdkCached;
+  try {
+    sandboxSdkCached = require('@getyoti/sdk-sandbox') as SandboxSdk;
+    return sandboxSdkCached;
+  } catch (err) {
+    sandboxSdkCached = null;
+    console.warn('⚠️ Yoti sandbox SDK not installed; sandbox response injection disabled.');
+    return null;
+  }
+}
 
 
 
@@ -559,7 +573,25 @@ console.log(`🌍 Environment: ${isSandbox ? 'sandbox' : 'production'}`);
 
     // 🧪 Inject test result if sandbox
     if (isSandbox) {
-      const sandboxClient = new SandboxIDVClientBuilder()
+      const sandboxSdk = getSandboxSdk();
+      if (!sandboxSdk) {
+        console.warn('⚠️ Skipping Yoti sandbox response injection (missing @getyoti/sdk-sandbox).');
+      } else {
+        const {
+          SandboxIDVClientBuilder,
+          SandboxRecommendationBuilder,
+          SandboxBreakdownBuilder,
+          SandboxDocumentAuthenticityCheckBuilder,
+          SandboxDocumentTextDataCheckBuilder,
+          SandboxZoomLivenessCheckBuilder,
+          SandboxDocumentFaceMatchCheckBuilder,
+          SandboxDocumentTextDataExtractionTaskBuilder,
+          SandboxCheckReportsBuilder,
+          SandboxTaskResultsBuilder,
+          SandboxResponseConfigBuilder,
+        } = sandboxSdk;
+
+        const sandboxClient = new SandboxIDVClientBuilder()
         .withClientSdkId(YOTI_CLIENT_SDK_ID)
         .withPemString(YOTI_KEY)
         .build();
@@ -615,7 +647,8 @@ console.log(`🌍 Environment: ${isSandbox ? 'sandbox' : 'production'}`);
         )
         .build();
 
-      await sandboxClient.configureSessionResponse(sessionId, responseConfig);
+        await sandboxClient.configureSessionResponse(sessionId, responseConfig);
+      }
     }
 
     res.status(200).json({ sessionId, clientSessionToken, isSandbox, });
